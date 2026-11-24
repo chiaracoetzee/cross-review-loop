@@ -26,7 +26,7 @@ min_families = 2               # refuse to start with fewer distinct model famil
 soft_round_ceiling = 6         # pause and ask user after this many rounds
 live_quota_probe = true        # run live agy /usage + tiny Claude haiku check before init and on `xreview quota`
 fallback_to_extras_at = 0.75   # back out of heavyweight core models when a plan is >= 75% used
-auto_drop_exhausted = true     # drop 100%-exhausted plans at init (down to a 2-family hard floor)
+auto_drop_exhausted = true     # drop 100%-exhausted plans at init and mid-run (down to a 2-family hard floor)
 min_families_on_exhaustion = 2 # minimum distinct families when an exhausted plan is auto-dropped
 shed_extras_at = 0.8           # drop extras mid-run if a plan crosses 80% (when both core & extra started)
 timeout_seconds = 0            # 0 = no per-turn timeout

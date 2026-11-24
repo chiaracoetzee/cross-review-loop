@@ -225,13 +225,21 @@ class Round3RegressionTests(unittest.TestCase):
             f3 = ledger.get_finding(by_key["a-3"])
             self.assertFalse(f3.found_by[0].conceded)
 
-            # astra-63: permanently dropping carbon while carbon has pending merge on a-2 marks a-2 unverified
+            # astra-63: permanently dropping carbon while carbon has pending merge:
+            # - on a `fixed` finding with a live non-implementor reviewer, assign replacement_verifier instead of nuking to unverified
             f2 = ledger.get_finding(by_key["a-2"])
             carbon_fr = next(fr for fr in f2.found_by if fr.reviewer == "carbon")
             self.assertFalse(carbon_fr.merge_accepted)
             ledger.reviewers["carbon"].status = "dropped_quota"
             unverified = _handle_dropouts_and_replacements(ledger, clock, round_num=2)
-            self.assertIn(by_key["a-2"], unverified)
+            self.assertNotIn(by_key["a-2"], unverified)
+            self.assertEqual(f2.state, "open")
+            self.assertIsNotNone(f2.replacement_verifier)
+            # - on a `rejected` or `deferred` finding, a dropped finder's pending merge STILL marks unverified
+            f2.disposition = "rejected"
+            f2.replacement_verifier = None
+            unverified_rej = _handle_dropouts_and_replacements(ledger, clock, round_num=2)
+            self.assertIn(by_key["a-2"], unverified_rej)
             self.assertEqual(f2.state, "unverified")
 
     def test_astra_64_crash_resume_when_quorum_already_broken_mid_round(self) -> None:

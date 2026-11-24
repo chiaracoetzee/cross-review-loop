@@ -78,7 +78,7 @@ from xreview.snapshot import (
     verify_repo_is_worktree_root,
 )
 
-_PERMANENT_DROPPED_STATUSES = frozenset({"dropped_quota", "shed_allowance", "substituted"})
+_PERMANENT_DROPPED_STATUSES = frozenset({"dropped_quota", "dropped_user", "shed_allowance", "substituted"})
 
 
 class ProtocolError(ValueError):
@@ -660,6 +660,8 @@ def merge_findings(
                 )
 
         dst.source_evidence_ids = sorted(set(dst.source_evidence_ids) | set(src.source_evidence_ids))
+        if dst.replacement_verifier:
+            dst.replacement_verified_revision = 0
         if dst.disposition == "deferred" and dst.effective_severity == "major":
             dst.deferral_requires_concession = True
 
@@ -770,6 +772,60 @@ def substitute_reviewer(
         return ledger
 
 
+def drop_reviewer(
+    run_dir: Path,
+    config: AppConfig,
+    reviewer_name: str,
+    *,
+    now_fn: Callable[[], str] = default_now_iso,
+) -> RunLedger:
+    """Permanently drop a reviewer from the run (lowering quorum to the exhaustion floor if needed)."""
+    with run_lock(run_dir):
+        ledger = load_ledger(run_dir)
+        _assert_not_in_progress(ledger)
+        if reviewer_name not in ledger.reviewers:
+            raise ProtocolError(f"Reviewer {reviewer_name!r} is not part of run {ledger.run_id}.")
+        rstate = ledger.reviewers[reviewer_name]
+        if rstate.status in _PERMANENT_DROPPED_STATUSES:
+            raise ProtocolError(
+                f"Reviewer {reviewer_name!r} is already permanently dropped (status={rstate.status!r})."
+            )
+
+        remaining = [r.config for r in ledger.live_reviewers() if r.config.name != reviewer_name]
+        eff_min_fams = ledger.min_families_override or config.policy.min_families
+        floor_fams = min(eff_min_fams, max(2, config.policy.min_families_on_exhaustion))
+        check_quorum(remaining, floor_fams, ledger.implementor_family)
+
+        rem_families = {r.family for r in remaining}
+        if len(rem_families) < eff_min_fams:
+            ledger.min_families_override = floor_fams
+            eff_min_fams = floor_fams
+
+        rstate.status = "dropped_quota" if rstate.status == "quota_paused" else "dropped_user"
+        if not rstate.initial_review_completed:
+            rstate.session_id = None
+        ledger.gates_lifted.append(GateLift(kind="reviewers", detail=f"drop {reviewer_name}"))
+
+        for f in ledger.findings:
+            if f.state == "open" and f.replacement_verifier == reviewer_name:
+                f.replacement_verifier = None
+                f.replacement_verified_revision = 0
+        _handle_dropouts_and_replacements(ledger, now_fn, ledger.current_round)
+
+        ledger.pause_causes = [
+            c for c in ledger.pause_causes
+            if c not in (f"quota:{reviewer_name}", f"incomplete:{reviewer_name}")
+            and not c.startswith("quorum:")
+        ]
+        try:
+            check_quorum([r.config for r in ledger.live_reviewers()], eff_min_fams, ledger.implementor_family)
+        except PolicyViolation as exc:
+            ledger.pause_causes.append(f"quorum:{exc}")
+        _rebuild_pause_reason(ledger)
+        save_ledger(run_dir, ledger)
+        return ledger
+
+
 # --- Pre-round guards & single-obligation sequencing ---
 
 def validate_ready_for_next_round(ledger: RunLedger) -> None:
@@ -841,13 +897,16 @@ def _handle_dropouts_and_replacements(
         if not dropped_finders:
             continue
 
-        # astra-63: A permanently dropped finder with an unresolved merge or severity dispute cannot vote -> unverified!
+        # astra-63: A permanently dropped finder with an unresolved severity dispute cannot vote -> unverified.
+        # For an unresolved merge on a `fixed` finding, hand verification (including the merged finding details)
+        # to a live non-implementor replacement verifier instead of discarding the fix; on rejected/deferred
+        # findings (or when no replacement exists), mark unverified.
         dropped_has_merge = any(not fr.merge_accepted or bool(fr.pending_merges) for fr in dropped_finders)
         dropped_has_sev = bool(
             f.proposed_severity
             and any(SEVERITY_RANK[fr.severity] > SEVERITY_RANK[f.proposed_severity] for fr in dropped_finders)
         )
-        if dropped_has_merge or dropped_has_sev:
+        if dropped_has_sev or (dropped_has_merge and f.disposition in ("rejected", "deferred")):
             f.state = "unverified"
             f.round_closed = round_num
             f.escalation_reason = "Dropped finder(s) left an unresolved merge or severity dispute"
@@ -856,7 +915,10 @@ def _handle_dropouts_and_replacements(
             continue
 
         if f.disposition == "fixed":
-            needs_replacement = any(fr.verified_fix_revision < f.fix_revision for fr in dropped_finders)
+            needs_replacement = any(
+                fr.verified_fix_revision < f.fix_revision or not fr.merge_accepted or bool(fr.pending_merges)
+                for fr in dropped_finders
+            )
             if not needs_replacement:
                 continue
             if f.replacement_verifier and f.replacement_verifier in live:
@@ -877,8 +939,17 @@ def _handle_dropouts_and_replacements(
                 chosen = candidates[0].config.name
                 f.replacement_verifier = chosen
                 f.replacement_verified_revision = 0
+                detail: dict[str, Any] = {"replacement_verifier": chosen}
+                if dropped_has_merge:
+                    merged_ids = [
+                        mid
+                        for fr in dropped_finders
+                        for mid in (list(fr.pending_merges) or ([fr.merged_from] if fr.merged_from and not fr.merge_accepted else []))
+                    ]
+                    if merged_ids:
+                        detail["covering_dropped_merges"] = merged_ids
                 f.history.append(
-                    HistoryEvent("reassigned", round_num, "xreview", ts, {"replacement_verifier": chosen})
+                    HistoryEvent("reassigned", round_num, "xreview", ts, detail)
                 )
             else:
                 # If a quota_paused independent core could still resume, wait instead of marking terminally unverified (astra-34)!
@@ -887,6 +958,8 @@ def _handle_dropouts_and_replacements(
                     if r.status == "quota_paused" and (not impl or r.config.family != impl)
                 ]
                 if not paused_independent:
+                    f.replacement_verifier = None
+                    f.replacement_verified_revision = 0
                     f.state = "unverified"
                     f.round_closed = round_num
                     f.escalation_reason = "Finder(s) dropped out and no live non-implementor family remains to verify fix"
@@ -1201,11 +1274,46 @@ def _build_followup_message(
                     except KeyError:
                         pass
 
-        if cold_restart and (reviewer.name in f.finder_names() or f.replacement_verifier == reviewer.name):
+        # Always include finding details for a replacement verifier (even on warm sessions,
+        # since they did not author the original finding) and on cold restarts.
+        show_full_details = (f.replacement_verifier == reviewer.name) or (
+            cold_restart and reviewer.name in f.finder_names()
+        )
+        if show_full_details:
             lines.append(f"  - Evidence: {f.evidence}")
             lines.append(f"  - Failure scenario: {f.failure_scenario}")
             lines.append(f"  - Suggested fix: {f.suggested_fix}")
-            if f.history:
+            if f.replacement_verifier == reviewer.name:
+                perm_dropped_names = {
+                    name for name, r in ledger.reviewers.items()
+                    if r.status in _PERMANENT_DROPPED_STATUSES
+                }
+                for d_fr in f.found_by:
+                    if d_fr.reviewer not in perm_dropped_names or d_fr.conceded:
+                        continue
+                    d_merges = list(d_fr.pending_merges) or (
+                        [d_fr.merged_from] if d_fr.merged_from and not d_fr.merge_accepted else []
+                    )
+                    for mid in d_merges:
+                        try:
+                            src_f = ledger.get_finding(mid)
+                            if should_redact_finding_for_recipient(src_f.source_evidence_ids, recipient_current_visibility):
+                                lines.append(
+                                    f"  - Merged finding `{src_f.ledger_id}` from dropped reviewer `{d_fr.reviewer}` "
+                                    "(details redacted due to evidence visibility)"
+                                )
+                            else:
+                                lines.append(
+                                    f"  - Merged finding `{src_f.ledger_id}` from dropped reviewer `{d_fr.reviewer}` "
+                                    f"(also verify this is addressed by the fix; reply `fix_incomplete` if not): "
+                                    f"(`{src_f.effective_severity}`, `{_sanitize_label(src_f.file)}:{src_f.line}`) {src_f.title}"
+                                )
+                                lines.append(f"    - Evidence: {src_f.evidence}")
+                                lines.append(f"    - Failure scenario: {src_f.failure_scenario}")
+                                lines.append(f"    - Suggested fix: {src_f.suggested_fix}")
+                        except KeyError:
+                            pass
+            if cold_restart and f.history:
                 lines.append("  - History:")
                 for h in f.history:
                     if should_redact_finding_for_recipient(h.evidence_ids, recipient_current_visibility):
@@ -1849,6 +1957,8 @@ def run_round(
         valid_replies: dict[str, dict[str, Any]] = {}
         incomplete_reviewers: set[str] = set()
 
+        quota_exhausted_cores: list[str] = []
+        any_quota_dropped = False
         for rname, (res, val_errors) in results_map.items():
             rstate = ledger.reviewers[rname]
             if res.quota_exhausted:
@@ -1856,10 +1966,10 @@ def run_round(
                     rstate.session_id = None
                 if rstate.config.extra:
                     rstate.status = "dropped_quota"
+                    any_quota_dropped = True
                     warnings.append(f"Dropped extra reviewer {rname} (quota exhausted)")
                 else:
-                    rstate.status = "quota_paused"
-                    pause_causes.append(f"quota:{rname}")
+                    quota_exhausted_cores.append(rname)
                 continue
 
             if val_errors or res.reply is None or res.returncode != 0 or res.error:
@@ -1878,6 +1988,54 @@ def run_round(
             rstate.consecutive_incomplete = 0
             rstate.initial_review_completed = True
             valid_replies[rname] = res.reply
+
+        floor_fams = min(eff_min_fams, max(2, config.policy.min_families_on_exhaustion))
+        if quota_exhausted_cores:
+            can_auto_drop = False
+            if config.policy.auto_drop_exhausted:
+                exhausted_set = set(quota_exhausted_cores)
+                remaining_live = [
+                    r.config for r in ledger.live_reviewers() if r.config.name not in exhausted_set
+                ]
+                try:
+                    check_quorum(remaining_live, floor_fams, ledger.implementor_family)
+                    can_auto_drop = True
+                except PolicyViolation:
+                    can_auto_drop = False
+
+            if can_auto_drop:
+                any_quota_dropped = True
+                rem_fams = sorted({
+                    r.config.family for r in ledger.live_reviewers()
+                    if r.config.name not in quota_exhausted_cores
+                })
+                for rname in quota_exhausted_cores:
+                    rstate = ledger.reviewers[rname]
+                    rstate.status = "dropped_quota"
+                    warnings.append(
+                        f"Auto-dropped exhausted core reviewer {rname} (plan {rstate.config.plan_id!r}); "
+                        f"continuing with {len(rem_fams)} families ({rem_fams})."
+                    )
+            else:
+                for rname in quota_exhausted_cores:
+                    rstate = ledger.reviewers[rname]
+                    rstate.status = "quota_paused"
+                    pause_causes.append(f"quota:{rname}")
+
+        if any_quota_dropped and config.policy.auto_drop_exhausted:
+            remaining_live = [r.config for r in ledger.live_reviewers()]
+            rem_fams = {r.family for r in remaining_live}
+            if len(rem_fams) < eff_min_fams:
+                try:
+                    check_quorum(remaining_live, floor_fams, ledger.implementor_family)
+                    ledger.min_families_override = floor_fams
+                    eff_min_fams = floor_fams
+                    warnings.append(
+                        f"Lowered run quorum from {config.policy.min_families} to {floor_fams} "
+                        f"after mid-run quota drop (remaining families: {sorted(rem_fams)})."
+                    )
+                except PolicyViolation:
+                    pass
 
         new_findings_ids: list[str] = []
         closed_findings_ids: list[str] = []
@@ -2105,13 +2263,16 @@ def run_round(
                             closed_findings_ids.append(f.ledger_id)
                             continue
 
-                if any(not fr.merge_accepted or bool(fr.pending_merges) for fr in unconceded) or f.proposed_severity:
+                if any(not fr.merge_accepted or bool(fr.pending_merges) for fr in live_active) or f.proposed_severity:
                     continue
 
                 if f.disposition == "fixed":
                     live_all_ok = all(fr.verified_fix_revision == f.fix_revision for fr in live_active)
-                    # Check if any permanently dropped finder still lacked approval for this revision (astra-29)
-                    dropped_unverified = [fr for fr in dropped_active if fr.verified_fix_revision < f.fix_revision]
+                    # Check if any permanently dropped finder still lacked approval or had an unconfirmed merge (astra-29)
+                    dropped_unverified = [
+                        fr for fr in dropped_active
+                        if fr.verified_fix_revision < f.fix_revision or not fr.merge_accepted or bool(fr.pending_merges)
+                    ]
                     if not dropped_unverified:
                         if (live_active or dropped_active) and live_all_ok:
                             f.state = "closed"

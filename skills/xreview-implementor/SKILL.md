@@ -28,16 +28,18 @@ Configure your implementor harness so lifting a gate always prompts the user:
         "Bash(xreview *--no-sandbox*)",
         "Bash(xreview *--resume-pause*)",
         "Bash(xreview *substitute*)",
+        "Bash(xreview *drop*)",
         "Bash(python3 -m xreview *--allow*)",
         "Bash(python3 -m xreview *--reviewers*)",
         "Bash(python3 -m xreview *--no-sandbox*)",
         "Bash(python3 -m xreview *--resume-pause*)",
-        "Bash(python3 -m xreview *substitute*)"
+        "Bash(python3 -m xreview *substitute*)",
+        "Bash(python3 -m xreview *drop*)"
       ]
     }
   }
   ```
-- **Antigravity (`agy` settings):** add `ask` rules for `run_command` matching `xreview *--allow*`, `xreview *--reviewers*`, `xreview *--no-sandbox*`, `xreview *--resume-pause*`, and `xreview *substitute*`.
+- **Antigravity (`agy` settings):** add `ask` rules for `run_command` matching `xreview *--allow*`, `xreview *--reviewers*`, `xreview *--no-sandbox*`, `xreview *--resume-pause*`, `xreview *substitute*`, and `xreview *drop*`.
 
 ## Workflow
 
@@ -91,7 +93,7 @@ Configure your implementor harness so lifting a gate always prompts the user:
    - Watch for `HINT (overlapping fix lines)`: verify you did not undo an earlier fix.
    - Repeat steps 3–4 until:
      - **Exit `0` (converged):** present `LEDGER.md` (and any escalated or unverified items) to the user alongside your commit proposal.
-     - **Exit `20` (paused):** stop and present the pause reason and current ledger to the user before continuing.
+     - **Exit `20` (paused):** stop and present the pause reason and current ledger to the user before continuing (the user may approve `--resume-pause`, `xreview substitute <run-id> <old> --with <new>`, or `xreview drop <run-id> <reviewer>`).
 
 5. **Clean up** after the user finishes reviewing the ledger:
    ```bash

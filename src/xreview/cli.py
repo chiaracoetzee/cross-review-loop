@@ -28,6 +28,7 @@ from xreview.protocol import (
     attach_evidence,
     classify_files,
     clean_run,
+    drop_reviewer,
     init_run,
     merge_findings,
     resolve_trusted_run_dir,
@@ -46,11 +47,13 @@ GATE_ASK_PATTERNS: tuple[str, ...] = (
     "Bash(xreview *--no-sandbox*)",
     "Bash(xreview *--resume-pause*)",
     "Bash(xreview *substitute*)",
+    "Bash(xreview *drop*)",
     "Bash(python3 -m xreview *--allow*)",
     "Bash(python3 -m xreview *--reviewers*)",
     "Bash(python3 -m xreview *--no-sandbox*)",
     "Bash(python3 -m xreview *--resume-pause*)",
     "Bash(python3 -m xreview *substitute*)",
+    "Bash(python3 -m xreview *drop*)",
 )
 
 
@@ -167,6 +170,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_sub.add_argument("run_id")
     p_sub.add_argument("old_reviewer")
     p_sub.add_argument("--with", required=True, dest="new_reviewer", help="Name of enabled substitute reviewer")
+
+    # drop
+    p_drop = sub.add_parser(
+        "drop",
+        help="Permanently drop a reviewer (reassigns its open fixes to another non-implementor reviewer)",
+    )
+    p_drop.add_argument("run_id")
+    p_drop.add_argument("reviewer", help="Reviewer name to permanently drop from the run")
 
     # status
     p_st = sub.add_parser("status", help="Show run status, open findings, and unclassified files")
@@ -452,6 +463,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "substitute":
             ledger = substitute_reviewer(run_dir, config, args.old_reviewer, args.new_reviewer)
             print(f"Substituted {args.old_reviewer} -> {args.new_reviewer} in run {ledger.run_id}")
+            return 0
+
+        if args.command == "drop":
+            ledger = drop_reviewer(run_dir, config, args.reviewer)
+            live_names = [r.config.name for r in ledger.live_reviewers()]
+            print(
+                f"Dropped {args.reviewer} from run {ledger.run_id} "
+                f"(status={ledger.status}; active={', '.join(live_names)})"
+            )
             return 0
 
         if args.command == "round":

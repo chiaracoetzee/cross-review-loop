@@ -189,7 +189,7 @@ class Round2RegressionTests(unittest.TestCase):
                     ReviewerConfig("fable", "claude", "m3", "claude", "anthropic"),
                     ReviewerConfig("backup", "codex", "m4", "gpt", "openai"),
                 ),
-                policy=PolicyConfig(min_families=2),
+                policy=PolicyConfig(min_families=2, auto_drop_exhausted=False),
                 state_dir=root / "state",
                 implementor_family="claude",
             )

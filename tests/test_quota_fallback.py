@@ -1248,6 +1248,235 @@ class QuotaFallbackTests(unittest.TestCase):
                         probe_agy_plan_quota(cfg_h, "shared", no_sandbox=True, now_ts=now)
                     self.assertIn(expected, str(ctx_a.exception))
 
+    def test_mid_run_auto_drop_and_dropped_merge_replacement_verification(self) -> None:
+        from xreview.adapters.base import TurnResult
+        from xreview.ledger import load_ledger
+        from xreview.protocol import drop_reviewer, init_run, merge_findings, run_round, triage_finding
+        from xreview.policy import PolicyViolation
+        from xreview.snapshot import RepoSpec
+        from test_protocol import _finding
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _make_git_repo(root / "repo")
+            cfg = AppConfig(
+                reviewers=(
+                    ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
+                    ReviewerConfig("sol", "codex", "m1b", "gpt", "openai", extra=True),
+                    ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
+                    ReviewerConfig("fable", "claude", "m3", "claude", "anthropic"),
+                ),
+                policy=PolicyConfig(
+                    min_families=3,
+                    auto_drop_exhausted=True,
+                    min_families_on_exhaustion=2,
+                    quota_preflight=False,
+                    shed_extras_at=0.8,
+                ),
+                state_dir=root / "state",
+                implementor_family="claude",
+            )
+            clock = FakeClock()
+            carbon_prompts: dict[int, str] = {}
+
+            def handle(req):
+                name = req.reviewer.name
+                if req.round_num == 1:
+                    if name == "astra":
+                        return TurnResult(
+                            session_id="sa",
+                            reply=_reply(
+                                findings=[
+                                    _finding("a-1", "Null check missing", "blocker"),
+                                    _finding("a-2", "Astra sole finding", "major"),
+                                ]
+                            ),
+                            allowance_used_ratio=0.85,  # sheds same-plan extra `sol` after R1
+                        )
+                    return TurnResult(session_id=f"s-{name}", reply=_reply())
+                if req.round_num == 2:
+                    if name == "astra":
+                        return TurnResult(session_id="sa", quota_exhausted=True, error="usage limit", returncode=1)
+                    if name == "carbon":
+                        carbon_prompts.setdefault(2, req.prompt)
+                        return TurnResult(
+                            session_id="s-carbon",
+                            reply=_reply(
+                                responses=[{"ledger_id": "F-001", "verdict": "fix_ok", "argument": "Verified F-001 + merged sol finding"}]
+                            ),
+                        )
+                    return TurnResult(session_id=f"s-{name}", reply=_reply())
+                if req.round_num == 3:
+                    if name == "carbon":
+                        carbon_prompts.setdefault(3, req.prompt)
+                        return TurnResult(
+                            session_id="s-carbon",
+                            reply=_reply(
+                                responses=[{"ledger_id": "F-002", "verdict": "fix_ok", "argument": "Verified reassigned astra finding"}]
+                            ),
+                        )
+                    return TurnResult(session_id=f"s-{name}", reply=_reply())
+                return TurnResult(session_id=f"s-{name}", reply=_reply())
+
+            adapters = {h: FakeAdapter(h, handle) for h in ("codex", "agy", "claude")}
+            run_dir, _ = init_run(
+                cfg,
+                "r-autodrop",
+                [RepoSpec("repo", repo)],
+                "Mid-run auto-drop test",
+                no_sandbox=True,
+                adapter_lookup=adapters.__getitem__,
+                now_fn=clock,
+            )
+            # Round 1: astra raises F-001 and F-002 (at 85% -> sheds sol)
+            out1 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out1.status, "needs_triage")
+            leg = load_ledger(run_dir)
+            self.assertEqual(leg.reviewers["sol"].status, "shed_allowance")
+
+            # Simulate sol having also raised F-003 before shedding, then implementor merges F-003 into F-001 and fixes F-001 & F-002
+            from xreview.ledger import FinderRecord, Finding, save_ledger
+            leg.findings.append(
+                Finding(
+                    ledger_id="F-003",
+                    title="Sol duplicate null check",
+                    file="calc.py",
+                    line=1,
+                    evidence="sol saw None deref at calc.py:1",
+                    failure_scenario="crashes on None input",
+                    suggested_fix="guard None early",
+                    round_opened=1,
+                    found_by=[FinderRecord("sol", "gpt", "s-1", 1, "blocker", "high")],
+                )
+            )
+            save_ledger(run_dir, leg)
+            merge_findings(run_dir, "F-003", "F-001", reason="same null check", now_fn=clock)
+            (repo / "calc.py").write_text("def add(a, b):\n    return (a or 0) + (b or 0)\n", encoding="utf-8")
+            triage_finding(run_dir, "F-001", "fixed", note="added None guard", now_fn=clock)
+            triage_finding(run_dir, "F-002", "fixed", note="fixed sole astra issue", now_fn=clock)
+
+            # Round 2: astra hits quota -> MUST auto-drop without pausing, lower quorum to 2!
+            # F-001 (merged with shed sol) was verified by carbon in R2 and closes immediately;
+            # F-002 (sole astra finding) is reassigned to carbon for R3!
+            out2 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out2.status, "needs_triage", f"unexpected pause: {out2.pause_reason}")
+            self.assertEqual(out2.unverified_findings, [], "fixed finding with dropped merge must NOT be nuked to unverified")
+            self.assertIn("F-001", out2.closed_findings)
+            leg2 = load_ledger(run_dir)
+            self.assertEqual(leg2.reviewers["astra"].status, "dropped_quota")
+            self.assertEqual(leg2.min_families_override, 2)
+            f2 = leg2.get_finding("F-002")
+            self.assertEqual(f2.state, "open")
+            self.assertEqual(f2.replacement_verifier, "carbon")
+            # Round 2 prompt to warm carbon included sol's dropped merge details AND F-001's Evidence!
+            self.assertIn("Sol duplicate null check", carbon_prompts[2])
+            self.assertIn("sol saw None deref", carbon_prompts[2])
+
+            # Round 3: warm carbon sees full F-002 details (Evidence/Failure scenario/Suggested fix), verifies fix_ok -> run converges!
+            out3 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out3.status, "converged")
+            self.assertIn("F-002", out3.closed_findings)
+            self.assertIn("Evidence:", carbon_prompts[3])
+            self.assertIn("Failure scenario:", carbon_prompts[3])
+
+            # Also verify hard floor: dropping carbon (only non-implementor left) MUST be refused!
+            with self.assertRaises(PolicyViolation):
+                drop_reviewer(run_dir, cfg, "carbon", now_fn=clock)
+
+    def test_explicit_drop_reviewer_unpauses_paused_run_and_cli_gates(self) -> None:
+        from xreview.adapters.base import TurnResult
+        from xreview.cli import GATE_ASK_PATTERNS, main
+        from xreview.ledger import load_ledger
+        from xreview.protocol import drop_reviewer, init_run, run_round, triage_finding
+        from xreview.snapshot import RepoSpec
+        from test_protocol import _finding
+
+        self.assertIn("Bash(xreview *drop*)", GATE_ASK_PATTERNS)
+        self.assertIn("Bash(python3 -m xreview *drop*)", GATE_ASK_PATTERNS)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _make_git_repo(root / "repo")
+            cfg = AppConfig(
+                reviewers=(
+                    ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
+                    ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
+                    ReviewerConfig("fable", "claude", "m3", "claude", "anthropic"),
+                ),
+                policy=PolicyConfig(
+                    min_families=3,
+                    auto_drop_exhausted=False,  # force pause on core exhaustion so we can test manual `xreview drop`
+                    min_families_on_exhaustion=2,
+                    quota_preflight=False,
+                ),
+                state_dir=root / "state",
+                implementor_family="claude",
+            )
+            clock = FakeClock()
+
+            def handle(req):
+                if req.round_num == 1 and req.reviewer.name == "astra":
+                    return TurnResult(session_id="sa", reply=_reply(findings=[_finding("a-1", "Issue A", "major")]))
+                if req.round_num == 2 and req.reviewer.name == "astra":
+                    return TurnResult(session_id="sa", quota_exhausted=True, error="usage limit", returncode=1)
+                if req.round_num == 3 and req.reviewer.name == "carbon":
+                    return TurnResult(
+                        session_id="s-carbon",
+                        reply=_reply(responses=[{"ledger_id": "F-001", "verdict": "fix_ok", "argument": "looks good"}]),
+                    )
+                return TurnResult(session_id=f"s-{req.reviewer.name}", reply=_reply())
+
+            adapters = {h: FakeAdapter(h, handle) for h in ("codex", "agy", "claude")}
+            run_dir, _ = init_run(
+                cfg,
+                "r-drop",
+                [RepoSpec("repo", repo)],
+                "Drop test",
+                no_sandbox=True,
+                adapter_lookup=adapters.__getitem__,
+                now_fn=clock,
+            )
+            run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            (repo / "calc.py").write_text("def add(a, b):\n    return int(a) + int(b)\n", encoding="utf-8")
+            triage_finding(run_dir, "F-001", "fixed", note="fixed issue A", now_fn=clock)
+
+            out2 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out2.status, "paused")
+            self.assertEqual(load_ledger(run_dir).reviewers["astra"].status, "quota_paused")
+
+            # Explicit drop unpauses the run, lowers quorum to 2, and assigns carbon to verify F-001
+            leg_after = drop_reviewer(run_dir, cfg, "astra", now_fn=clock)
+            self.assertEqual(leg_after.status, "needs_triage")
+            self.assertEqual(leg_after.pause_causes, [])
+            self.assertEqual(leg_after.reviewers["astra"].status, "dropped_quota")
+            self.assertEqual(leg_after.min_families_override, 2)
+            self.assertEqual(leg_after.get_finding("F-001").replacement_verifier, "carbon")
+
+            # Next round runs WITHOUT --resume-pause, never retries astra, and converges via carbon!
+            out3 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out3.status, "converged")
+            self.assertIn("F-001", out3.closed_findings)
+
+            # CLI smoke test for `xreview drop` on an active non-essential reviewer
+            cfg_file = root / "config.toml"
+            cfg_file.write_text(
+                f'state_dir = "{root / "state"}"\n'
+                "[policy]\nmin_families = 3\nmin_families_on_exhaustion = 2\nquota_preflight = false\n",
+                encoding="utf-8",
+            )
+            run_dir2, _ = init_run(
+                cfg,
+                "r-drop-cli",
+                [RepoSpec("repo", repo)],
+                "Drop CLI test",
+                no_sandbox=True,
+                adapter_lookup=adapters.__getitem__,
+                now_fn=clock,
+            )
+            rc_cli = main(["--config", str(cfg_file), "drop", "r-drop-cli", "astra"])
+            self.assertEqual(rc_cli, 0)
+            self.assertEqual(load_ledger(run_dir2).reviewers["astra"].status, "dropped_user")
+
 
 if __name__ == "__main__":
     unittest.main()
