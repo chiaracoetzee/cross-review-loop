@@ -343,7 +343,7 @@ class Round3RegressionTests(unittest.TestCase):
             root = Path(td)
             repo = _make_git_repo(root / "repo")
             orig_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-            cfg = _make_cfg(root / "state")
+            cfg = _make_cfg(root / "state", policy=PolicyConfig(min_families=2, quota_preflight=False))
             run_dir, ledger = init_run(
                 cfg, "r-pin", [RepoSpec("repo", repo, base_rev="HEAD")], "Pin test", no_sandbox=True
             )

@@ -18,6 +18,7 @@ from xreview.adapters.base import (
     parse_json_from_text,
 )
 from xreview.config import TESTED_HARNESS_VERSIONS, AppConfig, ReviewerConfig
+from xreview.quota import parse_reset_hint_from_error
 from xreview.sandbox import SandboxSpec, run_in_sandbox
 
 
@@ -163,9 +164,13 @@ class ClaudeAdapter(HarnessAdapter):
         stream_errors: list[str] = []
         is_error_result = False
         saw_result = False
+        rate_limit_windows: dict[str, dict[str, Any]] = {}
+        rate_limit_rejected = False
+        rate_limit_resets_at: float | None = None
 
         def _on_line(line: str) -> None:
-            nonlocal session_id, structured_output, last_structured_tool_input, result_text, usage, is_error_result, saw_result
+            nonlocal session_id, structured_output, last_structured_tool_input, result_text, usage
+            nonlocal is_error_result, saw_result, rate_limit_rejected, rate_limit_resets_at
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
@@ -176,7 +181,25 @@ class ClaudeAdapter(HarnessAdapter):
                     req.on_session_id(session_id)
 
             ev_type = ev.get("type")
-            if ev_type == "assistant":
+            if ev_type == "rate_limit_event":
+                info = ev.get("rate_limit_info")
+                if isinstance(info, dict):
+                    top_status = str(info.get("status", "")).lower()
+                    if top_status in ("rejected", "rate_limited", "exhausted"):
+                        rate_limit_rejected = True
+                    if isinstance(info.get("resetsAt"), (int, float)):
+                        rate_limit_resets_at = float(info["resetsAt"])
+                    uwin = info.get("unifiedWindows")
+                    if isinstance(uwin, dict):
+                        for wname, wbody in uwin.items():
+                            if isinstance(wbody, dict) and isinstance(wbody.get("utilization"), (int, float)):
+                                rate_limit_windows[str(wname)] = {
+                                    "name": str(wname),
+                                    "used_ratio": float(wbody["utilization"]),
+                                    "resets_at": float(wbody["resetsAt"]) if isinstance(wbody.get("resetsAt"), (int, float)) else None,
+                                    "status": str(wbody.get("status", "")),
+                                }
+            elif ev_type == "assistant":
                 msg = ev.get("message") or {}
                 for block in msg.get("content") or ():
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "StructuredOutput":
@@ -217,11 +240,21 @@ class ClaudeAdapter(HarnessAdapter):
         diag_err = err_only
         if is_error_result and result_text:
             diag_err += ("\n" if diag_err else "") + result_text
-        quota = not succeeded and detect_quota_exhausted(diag_err)
+        quota = not succeeded and (rate_limit_rejected or detect_quota_exhausted(diag_err))
         malformed = bool(succeeded and reply is None)
         resume_failed = bool(
             req.session_id and not succeeded and not quota and not sb_res.timed_out and detect_resume_failed(err_only)
         )
+
+        quota_windows_list = list(rate_limit_windows.values())
+        allowance_ratio = (
+            max((float(w["used_ratio"]) for w in quota_windows_list), default=None)
+            if quota_windows_list
+            else None
+        )
+        resets_at = rate_limit_resets_at
+        if resets_at is None and quota:
+            resets_at = parse_reset_hint_from_error(diag_err)
 
         error = None
         if sb_res.timed_out:
@@ -238,7 +271,9 @@ class ClaudeAdapter(HarnessAdapter):
             reply=reply,
             raw_text=result_text,
             usage=usage,
-            allowance_used_ratio=None,
+            allowance_used_ratio=allowance_ratio,
+            quota_windows=quota_windows_list,
+            quota_resets_at=resets_at,
             quota_exhausted=quota,
             resume_failed=resume_failed,
             malformed_output=malformed,

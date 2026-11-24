@@ -54,6 +54,7 @@ Configure your implementor harness so lifting a gate always prompts the user:
    ```
    - Add `--tag security` if the work touches a security vulnerability.
    - Add `--repo <path>` once per repository when changes span multiple repos.
+   - If `init` reports `quota_adjustments` (backing out of heavyweight core models onto cheaper extras, or dropping an exhausted plan), always relay those notices to the user alongside the run summary. You can inspect current known plan quotas anytime with `xreview quota`.
    - Attach minimal, pseudonymized evidence files (if needed) with `xreview evidence <run-id> --file <path> --source "<cmd/query>" --tag <tag>`.
 
 2. **Run Round 1 (blind):**

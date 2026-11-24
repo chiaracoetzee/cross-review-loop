@@ -16,6 +16,12 @@ from xreview.adapters import list_adapters
 from xreview.config import ConfigError, load_config, validate_repo_alias
 from xreview.ledger import load_ledger, render_ledger_markdown
 from xreview.policy import PolicyViolation
+from xreview.quota import (
+    apply_pre_flight_quota_policy,
+    format_reset_time,
+    inspect_plan_quotas,
+    refresh_plan_quotas,
+)
 from xreview.protocol import (
     ProtocolError,
     attach_evidence,
@@ -110,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--allow", action="append", default=[], help="Allow vendor(s) for an evidence tag: <tag>=<v1,v2>")
     p_init.add_argument("--implementor-family", default=None, help="Model family of the implementor (e.g., claude, gemini, gpt)")
     p_init.add_argument("--no-sandbox", action="store_true", help="Explicit opt-in to run without bubblewrap sandbox")
+    p_init.add_argument("--no-refresh-quota", action="store_true", help="Skip live quota refresh probe during init")
     p_init.add_argument("--json", action="store_true", help="Output JSON")
 
     # classify
@@ -187,6 +194,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc = sub.add_parser("doctor", help="Check sandbox, harnesses, versions, and config")
     p_doc.add_argument("--json", action="store_true", help="Output JSON")
 
+    # quota
+    p_q = sub.add_parser("quota", help="Show latest known plan quotas and automatic fallback actions")
+    p_q.add_argument("--refresh", action="store_true", help="Run a tiny sandboxed haiku probe to refresh live Claude quota")
+    p_q.add_argument("--no-sandbox", action="store_true", help="Run refresh probe without bwrap sandbox (explicit opt-in)")
+    p_q.add_argument("--json", action="store_true", help="Output JSON")
+
     return p
 
 
@@ -225,6 +238,67 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "setup-gates":
             return _handle_setup_gates(args.claude_settings.expanduser(), args.check)
+
+        if args.command == "quota":
+            now_ts = datetime.now(timezone.utc).timestamp()
+            probe_warnings: list[str] = []
+            if args.refresh:
+                statuses, probe_warnings = refresh_plan_quotas(
+                    config,
+                    force=True,
+                    no_sandbox=args.no_sandbox,
+                    now_ts=now_ts,
+                )
+            else:
+                statuses = inspect_plan_quotas(config, now_ts=now_ts)
+            enabled = [r for r in config.reviewers if r.enabled]
+            adj = apply_pre_flight_quota_policy(enabled, config, statuses, now_ts=now_ts)
+            plans_out: dict[str, dict] = {}
+            for pid, st in sorted(statuses.items()):
+                used = st.effective_used_ratio(now_ts)
+                exhausted = st.is_exhausted(now_ts)
+                reset_ts = st.next_reset_at(now_ts)
+                action = "ok"
+                if pid in adj.dropped_exhausted_plans:
+                    action = "drop_exhausted"
+                elif pid in adj.fallback_plans:
+                    action = "fallback_to_extras"
+                elif exhausted:
+                    action = "exhausted_kept"
+                plans_out[pid] = {
+                    "harness": st.harness,
+                    "source": st.source,
+                    "exhausted": exhausted,
+                    "used_ratio": round(used, 4) if used is not None else None,
+                    "resets_at": reset_ts,
+                    "resets_local": format_reset_time(reset_ts) if reset_ts is not None else None,
+                    "windows": [w.to_dict() for w in st.active_windows(now_ts)],
+                    "planned_action": action,
+                }
+            payload = {
+                "fallback_to_extras_at": config.policy.fallback_to_extras_at,
+                "auto_drop_exhausted": config.policy.auto_drop_exhausted,
+                "plans": plans_out,
+                "planned_reviewers": [r.name for r in adj.reviewers],
+                "notices": adj.notices,
+                "warnings": probe_warnings,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                for pid, pinfo in plans_out.items():
+                    pct = f"{pinfo['used_ratio'] * 100:.0f}%" if pinfo["used_ratio"] is not None else "unknown"
+                    rst = f", resets {pinfo['resets_local']}" if pinfo["resets_local"] else ""
+                    print(
+                        f"  {pid:10s} ({pinfo['harness']:6s}): {pct:7s} "
+                        f"[{pinfo['planned_action']}] (source={pinfo['source']}{rst})"
+                    )
+                for n in adj.notices:
+                    print(f"NOTICE: {n}")
+                for w in probe_warnings:
+                    print(f"WARNING: {w}", file=sys.stderr)
+                print(f"Planned reviewers: {', '.join(payload['planned_reviewers']) or '(none)'}")
+            return 0
 
         if args.command == "doctor":
             info = {
@@ -280,6 +354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 docs=docs,
                 implementor_family=args.implementor_family,
                 no_sandbox=args.no_sandbox,
+                refresh_quota=False if args.no_refresh_quota else None,
             )
             out = {
                 "run_id": ledger.run_id,
@@ -288,16 +363,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "run_tags": ledger.run_tags,
                 "sandbox_mode": ledger.sandbox_mode,
                 "gates_lifted": [g.to_dict() for g in ledger.gates_lifted],
+                "quota_adjustments": list(ledger.quota_adjustments),
                 "version_warnings": {
                     k: v.version_warning for k, v in ledger.reviewers.items() if v.version_warning
                 },
             }
             if args.json:
                 print(json.dumps(out, indent=2))
+                for note in ledger.quota_adjustments:
+                    print(f"NOTICE (quota): {note}", file=sys.stderr)
             else:
                 print(f"Initialized run {ledger.run_id} at {run_dir}")
                 print(f"Reviewers: {', '.join(out['reviewers'])}")
                 print(f"Sandbox:   {ledger.sandbox_mode}")
+                for note in ledger.quota_adjustments:
+                    print(f"NOTICE (quota): {note}", file=sys.stderr)
                 if out["version_warnings"]:
                     for r, w in out["version_warnings"].items():
                         print(f"WARNING ({r}): {w}", file=sys.stderr)

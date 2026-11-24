@@ -93,7 +93,9 @@ class AdapterAndCliTests(unittest.TestCase):
                 'reviewers = [\n'
                 '  { name = "astra", harness = "codex", model = "m1", family = "gpt" },\n'
                 '  { name = "carbon", harness = "agy", model = "m2", family = "gemini" },\n'
-                ']\n',
+                ']\n'
+                '[policy]\n'
+                'quota_preflight = false\n',
                 encoding="utf-8",
             )
             old_cwd = os.getcwd()

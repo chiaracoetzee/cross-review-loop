@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +49,14 @@ from xreview.policy import (
     should_redact_finding_for_recipient,
     tags_for_paths,
     visible_evidence_ids,
+)
+from xreview.quota import (
+    PlanQuotaStatus,
+    QuotaWindow,
+    apply_pre_flight_quota_policy,
+    inspect_plan_quotas,
+    record_plan_quota,
+    refresh_plan_quotas,
 )
 from xreview.sandbox import bwrap_available
 from xreview.schema import (
@@ -172,8 +181,10 @@ def init_run(
     docs: list[Path] | None = None,
     implementor_family: str | None = None,
     no_sandbox: bool = False,
+    refresh_quota: bool | None = None,
     adapter_lookup: Callable[[str], HarnessAdapter] = get_adapter,
     now_fn: Callable[[], str] = default_now_iso,
+    quota_inspector: Callable[[AppConfig], dict[str, PlanQuotaStatus]] | None = None,
 ) -> tuple[Path, RunLedger]:
     """Initialize a new review run folder exclusively under flock with mode 0700."""
     validate_run_id(run_id)
@@ -226,6 +237,48 @@ def init_run(
         implementor_family=implementor_family,
     )
 
+    selected_reviewers = list(resolved.selected_reviewers)
+    quota_adjustments: list[str] = []
+    min_families_override: int | None = None
+    eff_impl = implementor_family or config.implementor_family
+
+    if config.policy.quota_preflight:
+        probe_warnings: list[str] = []
+        if quota_inspector is not None:
+            plan_statuses = quota_inspector(config)
+        else:
+            use_live = adapter_lookup is get_adapter
+            do_refresh = (
+                refresh_quota
+                if refresh_quota is not None
+                else (use_live and config.policy.refresh_stale_quota)
+            )
+            if do_refresh and use_live:
+                plan_statuses, probe_warnings = refresh_plan_quotas(
+                    config,
+                    force=False,
+                    no_sandbox=no_sandbox,
+                    include_host_codex_rollouts=True,
+                )
+            else:
+                plan_statuses = inspect_plan_quotas(
+                    config,
+                    include_host_codex_rollouts=use_live,
+                )
+        q_adj = apply_pre_flight_quota_policy(selected_reviewers, config, plan_statuses)
+        selected_reviewers = q_adj.reviewers
+        quota_adjustments = list(q_adj.notices) + probe_warnings
+        eff_min_fams = config.policy.min_families
+        if q_adj.dropped_exhausted_plans and config.policy.auto_drop_exhausted:
+            eff_min_fams = min(config.policy.min_families, max(2, config.policy.min_families_on_exhaustion))
+            if eff_min_fams != config.policy.min_families:
+                min_families_override = eff_min_fams
+        try:
+            check_quorum(selected_reviewers, eff_min_fams, eff_impl)
+        except PolicyViolation as exc:
+            detail = f" Quota adjustments: {'; '.join(quota_adjustments)}" if quota_adjustments else ""
+            raise PolicyViolation(f"{exc}{detail}") from exc
+
     use_bwrap = bwrap_available()
     if not use_bwrap and not no_sandbox:
         raise ProtocolError(
@@ -235,7 +288,7 @@ def init_run(
 
     # Validate adapters and reviewer names BEFORE reserving run_dir (astra-69)
     reviewer_states: dict[str, ReviewerRuntimeState] = {}
-    for rc in resolved.selected_reviewers:
+    for rc in selected_reviewers:
         validate_reviewer_name(rc.name)
         adapter = adapter_lookup(rc.harness)
         ver = adapter.version()
@@ -276,7 +329,9 @@ def init_run(
                 allow_map={k: list(v) for k, v in resolved.allow_map.items()},
                 post_run_hooks_enabled=resolved.post_run_hooks_enabled,
                 sandbox_mode=sandbox_mode,
-                implementor_family=(implementor_family or config.implementor_family),
+                implementor_family=eff_impl,
+                min_families_override=min_families_override,
+                quota_adjustments=quota_adjustments,
                 reviewers=reviewer_states,
             )
             save_ledger(run_dir, ledger)
@@ -658,8 +713,9 @@ def substitute_reviewer(
 
         # Allow incremental substitutions when multiple cores are quota-paused (astra-51)!
         quorum_err: str | None = None
+        eff_min_fams = ledger.min_families_override or config.policy.min_families
         try:
-            check_quorum(candidate_list, config.policy.min_families, ledger.implementor_family)
+            check_quorum(candidate_list, eff_min_fams, ledger.implementor_family)
         except PolicyViolation as exc:
             quorum_err = str(exc)
 
@@ -1495,18 +1551,19 @@ def run_round(
             validate_ready_for_next_round(ledger)
 
         live_configs = [r.config for r in ledger.live_reviewers()]
+        eff_min_fams = ledger.min_families_override or config.policy.min_families
         # On fresh round start, require quorum up front; on recovery, allow finalizing checkpointed work
         # into a durable quorum pause even if shedding broke quorum mid-round (astra-64)!
         can_launch_more = True
         if not resuming_in_progress:
-            check_quorum(live_configs, config.policy.min_families, ledger.implementor_family)
+            check_quorum(live_configs, eff_min_fams, ledger.implementor_family)
             pre_unverified = _handle_dropouts_and_replacements(ledger, now_fn, next_round)
             if next_round > 1:
                 validate_ready_for_next_round(ledger)
         else:
             pre_unverified = []
             try:
-                check_quorum(live_configs, config.policy.min_families, ledger.implementor_family)
+                check_quorum(live_configs, eff_min_fams, ledger.implementor_family)
             except PolicyViolation:
                 can_launch_more = False
 
@@ -1727,6 +1784,34 @@ def run_round(
                     if res.quota_exhausted:
                         if rc.plan_id not in ledger.shed_plans:
                             ledger.shed_plans.append(rc.plan_id)
+                    if res.quota_windows or res.quota_exhausted or res.allowance_used_ratio is not None:
+                        try:
+                            q_wins = tuple(
+                                QuotaWindow.from_dict(w) for w in res.quota_windows if isinstance(w, dict)
+                            )
+                            if not q_wins and res.allowance_used_ratio is not None:
+                                q_wins = (
+                                    QuotaWindow(
+                                        name="plan",
+                                        used_ratio=res.allowance_used_ratio,
+                                        resets_at=res.quota_resets_at,
+                                        status="exhausted" if res.quota_exhausted else "allowed",
+                                    ),
+                                )
+                            record_plan_quota(
+                                config.state_dir,
+                                PlanQuotaStatus(
+                                    plan_id=rc.plan_id,
+                                    harness=rc.harness,
+                                    windows=q_wins,
+                                    exhausted=res.quota_exhausted,
+                                    exhausted_until=res.quota_resets_at if res.quota_exhausted else None,
+                                    source="quota_cache",
+                                    updated_at=time.time(),
+                                ),
+                            )
+                        except OSError:
+                            pass
                     save_ledger(run_dir, ledger)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(queues))) as pool:
@@ -2127,7 +2212,7 @@ def run_round(
 
         # Check live quorum (excluding temporarily quota_paused only when reporting quorum loss alongside quota pause)
         try:
-            check_quorum([r.config for r in ledger.live_reviewers()], config.policy.min_families, ledger.implementor_family)
+            check_quorum([r.config for r in ledger.live_reviewers()], eff_min_fams, ledger.implementor_family)
         except PolicyViolation as exc:
             pause_causes.append(f"quorum:{exc}")
 

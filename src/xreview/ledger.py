@@ -393,6 +393,8 @@ class RunLedger:
     pause_reason: str = ""
     pause_causes: list[str] = field(default_factory=list)
     soft_ceiling_override: int | None = None
+    min_families_override: int | None = None
+    quota_adjustments: list[str] = field(default_factory=list)
     shed_plans: list[str] = field(default_factory=list)  # Permanently shed plans (astra-44)
     included_files: list[str] = field(default_factory=list)
     excluded_files: list[str] = field(default_factory=list)
@@ -449,6 +451,8 @@ class RunLedger:
             "pause_reason": self.pause_reason,
             "pause_causes": list(self.pause_causes),
             "soft_ceiling_override": self.soft_ceiling_override,
+            "min_families_override": self.min_families_override,
+            "quota_adjustments": list(self.quota_adjustments),
             "shed_plans": sorted(set(self.shed_plans)),
             "included_files": list(self.included_files),
             "excluded_files": list(self.excluded_files),
@@ -505,6 +509,8 @@ class RunLedger:
             pause_reason=str(data.get("pause_reason", "")),
             pause_causes=list(data.get("pause_causes", ())),
             soft_ceiling_override=int(data["soft_ceiling_override"]) if data.get("soft_ceiling_override") is not None else None,
+            min_families_override=int(data["min_families_override"]) if data.get("min_families_override") is not None else None,
+            quota_adjustments=list(data.get("quota_adjustments", ())),
             shed_plans=list(data.get("shed_plans", ())),
             included_files=list(data.get("included_files", ())),
             excluded_files=list(data.get("excluded_files", ())),
@@ -585,6 +591,8 @@ def render_ledger_markdown(ledger: RunLedger) -> str:
         lines.append(f"- **Gates lifted:** {g_str}")
     else:
         lines.append("- **Gates lifted:** none")
+    if ledger.quota_adjustments:
+        lines.append("- **Quota adjustments:** " + "; ".join(ledger.quota_adjustments))
     if ledger.project_exclusions:
         lines.append(
             "- **Project file exclusions:** "

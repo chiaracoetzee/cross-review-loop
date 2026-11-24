@@ -271,6 +271,12 @@ class PolicyConfig:
     min_families: int = 2
     soft_round_ceiling: int = 6
     shed_extras_at: float = 0.8
+    fallback_to_extras_at: float | None = 0.75
+    auto_drop_exhausted: bool = True
+    min_families_on_exhaustion: int = 2
+    quota_preflight: bool = True
+    refresh_stale_quota: bool = True
+    quota_cache_max_age_seconds: int = 1800
     timeout_seconds: int = 1200
     serialize_same_harness: dict[str, bool] = field(
         default_factory=lambda: {"codex": True, "agy": True, "claude": False}
@@ -438,11 +444,20 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         for k, v in pol_raw["serialize_same_harness"].items():
             ser_default[str(k)] = bool(v)
 
+    raw_fallback = pol_raw.get("fallback_to_extras_at", 0.75)
+    fallback_at: float | None = None if raw_fallback in (None, False, 0, 0.0, "") else float(raw_fallback)
+
     policy = PolicyConfig(
         credits=str(pol_raw.get("credits", "never")),
         min_families=int(pol_raw.get("min_families", 2)),
         soft_round_ceiling=int(pol_raw.get("soft_round_ceiling", 6)),
         shed_extras_at=float(pol_raw.get("shed_extras_at", 0.8)),
+        fallback_to_extras_at=fallback_at,
+        auto_drop_exhausted=bool(pol_raw.get("auto_drop_exhausted", True)),
+        min_families_on_exhaustion=int(pol_raw.get("min_families_on_exhaustion", 2)),
+        quota_preflight=bool(pol_raw.get("quota_preflight", True)),
+        refresh_stale_quota=bool(pol_raw.get("refresh_stale_quota", True)),
+        quota_cache_max_age_seconds=int(pol_raw.get("quota_cache_max_age_seconds", 1800)),
         timeout_seconds=int(pol_raw.get("timeout_seconds", 1200)),
         serialize_same_harness=ser_default,
     )
@@ -450,10 +465,14 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         raise ConfigError(f"policy.credits must be 'never' or 'allow', got {policy.credits!r}")
     if policy.min_families < 1:
         raise ConfigError("policy.min_families must be >= 1")
+    if policy.min_families_on_exhaustion < 2:
+        raise ConfigError("policy.min_families_on_exhaustion must be >= 2")
     if policy.soft_round_ceiling < 1:
         raise ConfigError("policy.soft_round_ceiling must be >= 1")
     if not (0.0 < policy.shed_extras_at <= 1.0):
         raise ConfigError("policy.shed_extras_at must be in (0.0, 1.0]")
+    if policy.fallback_to_extras_at is not None and not (0.0 < policy.fallback_to_extras_at <= 1.0):
+        raise ConfigError("policy.fallback_to_extras_at must be in (0.0, 1.0] or disabled")
 
     profile = ProfileConfig()
     if data.get("profile"):

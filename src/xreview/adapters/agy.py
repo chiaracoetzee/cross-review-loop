@@ -18,6 +18,7 @@ from xreview.adapters.base import (
     parse_json_from_text,
 )
 from xreview.config import TESTED_HARNESS_VERSIONS, AppConfig, ReviewerConfig
+from xreview.quota import parse_reset_hint_from_error
 from xreview.sandbox import SandboxSpec, run_in_sandbox
 
 
@@ -313,6 +314,7 @@ class AgyAdapter(HarnessAdapter):
             raw_text=response_text,
             usage=usage_totals,
             allowance_used_ratio=None,
+            quota_resets_at=parse_reset_hint_from_error(diag_err) if quota else None,
             quota_exhausted=quota,
             resume_failed=resume_failed,
             malformed_output=malformed,

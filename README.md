@@ -20,7 +20,10 @@ A cross-vendor, multi-model code and design review loop built on subscription CL
 ```bash
 pip install -e . --no-build-isolation
 xreview doctor
+xreview quota --refresh
 ```
+
+`xreview quota` inspects cached plan utilization (from Codex session rollouts and Claude `rate_limit_event` telemetry stored in `<state_dir>/quota_cache.json`). Passing `--refresh` (or letting `xreview init` auto-refresh when Claude's cache is missing or older than `quota_cache_max_age_seconds`, default 30 min; opt out with `--no-refresh-quota`) runs a tiny sandboxed `haiku` probe to fetch live Claude `five_hour`/`seven_day` utilization before choosing reviewers. During `xreview init`, plans at or above `fallback_to_extras_at` (default `0.75`) automatically back out of heavyweight core models and promote their cheaper extra models, and plans that are 100% exhausted are removed (down to a hard floor of `2` distinct model families including at least one non-implementor family), printing a notice and recording the adjustment in `LEDGER.md`.
 
 Copy `examples/config.toml` to `~/.config/xreview/config.toml` and customize your reviewers and optional environment profile (see `examples/profile.toml`).
 

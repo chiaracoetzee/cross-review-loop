@@ -105,6 +105,8 @@ class TurnResult:
     raw_text: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
     allowance_used_ratio: float | None = None
+    quota_windows: list[dict[str, Any]] = field(default_factory=list)
+    quota_resets_at: float | None = None
     quota_exhausted: bool = False
     resume_failed: bool = False
     malformed_output: bool = False

@@ -47,7 +47,7 @@ class DogfoodRegressionTests(unittest.TestCase):
                     ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
                     ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
                 ),
-                policy=PolicyConfig(min_families=2),
+                policy=PolicyConfig(min_families=2, quota_preflight=False),
                 state_dir=root / "state",
             )
             run_dir, ledger = init_run(cfg, "r-root", [RepoSpec("repo", repo, base_rev="EMPTY")], "Root review", no_sandbox=True)
@@ -64,7 +64,7 @@ class DogfoodRegressionTests(unittest.TestCase):
                     ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
                     ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
                 ),
-                policy=PolicyConfig(min_families=2),
+                policy=PolicyConfig(min_families=2, quota_preflight=False),
                 state_dir=root / "state",
             )
             clock = FakeClock()
@@ -109,7 +109,7 @@ class DogfoodRegressionTests(unittest.TestCase):
                     ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
                     ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
                 ),
-                policy=PolicyConfig(min_families=2),
+                policy=PolicyConfig(min_families=2, quota_preflight=False),
                 profile=ProfileConfig(tags={"evtag": TagRule(name="evtag", vendors=("openai", "google"))}),
                 state_dir=root / "state",
             )
@@ -171,7 +171,7 @@ class DogfoodRegressionTests(unittest.TestCase):
                     ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
                     ReviewerConfig("sol", "codex", "m3", "gpt", "openai", extra=True),
                 ),
-                policy=PolicyConfig(min_families=2),
+                policy=PolicyConfig(min_families=2, quota_preflight=False),
                 implementor_family="gemini",
                 state_dir=root / "state",
             )

@@ -25,6 +25,7 @@ from xreview.config import (
     ReviewerConfig,
     safe_read_regular_file_under,
 )
+from xreview.quota import parse_reset_hint_from_error, read_codex_rollout_quota
 from xreview.sandbox import SandboxSpec, run_in_sandbox
 
 
@@ -292,6 +293,7 @@ class CodexAdapter(HarnessAdapter):
         succeeded = sb_res.returncode == 0 and not sb_res.timed_out and not turn_failed and turn_completed
         reply = parse_json_from_text(raw_text) if succeeded else None
 
+        rollout_q = read_codex_rollout_quota(req.state_host_dir / ".codex", session_id, plan_id=req.reviewer.plan_id)
         allowance_ratio, rl_reached = _read_codex_rollout_rate_limit(
             req.state_host_dir / ".codex", session_id
         )
@@ -302,6 +304,10 @@ class CodexAdapter(HarnessAdapter):
         resume_failed = bool(
             req.session_id and not succeeded and not quota and not sb_res.timed_out and detect_resume_failed(diag_err)
         )
+        quota_windows = [w.to_dict() for w in rollout_q.windows] if rollout_q else []
+        resets_at = (rollout_q.exhausted_until or (rollout_q.next_reset_at(rollout_q.updated_at) if rollout_q else None))
+        if resets_at is None and quota:
+            resets_at = parse_reset_hint_from_error(diag_err)
 
         error = None
         if sb_res.timed_out:
@@ -319,6 +325,8 @@ class CodexAdapter(HarnessAdapter):
             raw_text=raw_text,
             usage=usage,
             allowance_used_ratio=allowance_ratio,
+            quota_windows=quota_windows,
+            quota_resets_at=resets_at,
             quota_exhausted=quota,
             resume_failed=resume_failed,
             malformed_output=malformed,
