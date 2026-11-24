@@ -196,7 +196,7 @@ class AgyAdapter(HarnessAdapter):
             "--json-schema",
             schema_path,
             "--print-timeout",
-            f"{req.timeout_s}s",
+            f"{req.timeout_s if req.timeout_s > 0 else 0}s",
             "--log-file",
             log_path,
         ]
@@ -225,7 +225,7 @@ class AgyAdapter(HarnessAdapter):
             },
             vendor_hosts=config.vendor_hosts_for(req.reviewer.vendor),
             extra_ro_paths=config.profile.extra_ro_paths,
-            timeout_s=req.timeout_s + 30,
+            timeout_s=(req.timeout_s + 30) if req.timeout_s > 0 else 0,
             use_sandbox=use_sandbox,
         )
 

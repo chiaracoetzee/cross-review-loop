@@ -325,7 +325,7 @@ class SandboxSpec:
     secret_env: dict[str, str] = field(default_factory=dict)  # Never placed in host bwrap argv!
     vendor_hosts: tuple[str, ...] = ()
     extra_ro_paths: tuple[str, ...] = ()
-    timeout_s: int = 1200
+    timeout_s: int = 0
     use_sandbox: bool = True
 
     @property
@@ -462,7 +462,7 @@ def build_bwrap_command(
         cmd.extend(["--setenv", k, v])
 
     target_cmd = " ".join(shlex.quote(a) for a in spec.command)
-    bridge_idle = max(300, int(spec.timeout_s))
+    bridge_idle = max(300, int(spec.timeout_s)) if spec.timeout_s > 0 else 3600
     if use_socat:
         socat_exe = shlex.quote(socat_path or "/usr/bin/socat")
         bridge_start = (
@@ -577,9 +577,15 @@ def run_in_sandbox(
                 timed_out = True
                 _kill_group(proc)
 
-        timer = threading.Timer(spec.timeout_s, _mark_timeout)
-        timer.daemon = True
-        timer.start()
+        timer: threading.Timer | None = None
+        if spec.timeout_s > 0:
+            timer = threading.Timer(spec.timeout_s, _mark_timeout)
+            timer.daemon = True
+            timer.start()
+
+        def _cancel_timer() -> None:
+            if timer is not None:
+                timer.cancel()
 
         def _write_stdin() -> None:
             if proc.stdin is None:
@@ -630,7 +636,7 @@ def run_in_sandbox(
             with state_lock:
                 if not finished:
                     finished = True
-                    timer.cancel()
+                    _cancel_timer()
                     _kill_group(proc, already_exited=True)
 
         watch_thread = threading.Thread(target=_watch_leader_exit, daemon=True)
@@ -673,7 +679,7 @@ def run_in_sandbox(
             with state_lock:
                 if not finished:
                     finished = True
-                    timer.cancel()
+                    _cancel_timer()
                     _kill_group(proc, already_exited=True)
             proc.wait()
             err_thread.join(timeout=2)
@@ -681,7 +687,7 @@ def run_in_sandbox(
         except BaseException:
             with state_lock:
                 finished = True
-                timer.cancel()
+                _cancel_timer()
                 _kill_group(proc)
             if has_waitid:
                 watch_thread.join(timeout=2)
@@ -693,7 +699,7 @@ def run_in_sandbox(
         finally:
             with state_lock:
                 finished = True
-                timer.cancel()
+                _cancel_timer()
                 if proc.poll() is None:
                     _kill_group(proc)
             if has_waitid:
@@ -755,7 +761,7 @@ def run_in_sandbox(
             pass_fds = (secret_r,)
 
         try:
-            proxy_idle = max(300, int(spec.timeout_s))
+            proxy_idle = max(300, int(spec.timeout_s)) if spec.timeout_s > 0 else 3600
             with VendorProxy(
                 sock_path,
                 allowlist=spec.vendor_hosts,

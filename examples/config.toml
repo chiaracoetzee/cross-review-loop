@@ -29,7 +29,7 @@ fallback_to_extras_at = 0.75   # back out of heavyweight core models when a plan
 auto_drop_exhausted = true     # drop 100%-exhausted plans at init (down to a 2-family hard floor)
 min_families_on_exhaustion = 2 # minimum distinct families when an exhausted plan is auto-dropped
 shed_extras_at = 0.8           # drop extras mid-run if a plan crosses 80% (when both core & extra started)
-timeout_seconds = 1200         # 20 minutes per reviewer turn
+timeout_seconds = 0            # 0 = no per-turn timeout
 
 [auth]
 # claude_token_file = "~/.config/xreview/claude-oauth-token"

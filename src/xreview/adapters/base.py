@@ -93,7 +93,7 @@ class TurnRequest:
     docs_host_dir: Path | None = None
     prompt_filename: str = "PROMPT.md"
     session_id: str | None = None
-    timeout_s: int = 1200
+    timeout_s: int = 0
     allow_no_sandbox: bool = False
     on_session_id: Callable[[str], None] | None = None
 

@@ -288,7 +288,7 @@ class PolicyConfig:
     min_families_on_exhaustion: int = 2
     quota_preflight: bool = True
     live_quota_probe: bool = True
-    timeout_seconds: int = 1200
+    timeout_seconds: int = 0
     serialize_same_harness: dict[str, bool] = field(
         default_factory=lambda: {"codex": True, "agy": True, "claude": False}
     )
@@ -463,6 +463,16 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     raw_fallback = pol_raw.get("fallback_to_extras_at", 0.75)
     fallback_at: float | None = None if raw_fallback in (None, False, 0, 0.0, "") else float(raw_fallback)
 
+    raw_timeout = pol_raw.get("timeout_seconds", 0)
+    if raw_timeout is False or raw_timeout in (None, ""):
+        timeout_seconds = 0
+    elif isinstance(raw_timeout, bool):
+        raise ConfigError("policy.timeout_seconds must be a non-negative integer (0 = no timeout)")
+    else:
+        timeout_seconds = int(raw_timeout)
+    if timeout_seconds < 0:
+        raise ConfigError("policy.timeout_seconds must be >= 0 (0 = no timeout)")
+
     policy = PolicyConfig(
         credits=str(pol_raw.get("credits", "never")),
         min_families=int(pol_raw.get("min_families", 2)),
@@ -473,7 +483,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         min_families_on_exhaustion=int(pol_raw.get("min_families_on_exhaustion", 2)),
         quota_preflight=bool(pol_raw.get("quota_preflight", True)),
         live_quota_probe=bool(pol_raw.get("live_quota_probe", pol_raw.get("refresh_stale_quota", True))),
-        timeout_seconds=int(pol_raw.get("timeout_seconds", 1200)),
+        timeout_seconds=timeout_seconds,
         serialize_same_harness=ser_default,
     )
     if policy.credits not in ("never", "allow"):

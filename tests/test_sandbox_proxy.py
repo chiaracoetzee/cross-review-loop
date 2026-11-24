@@ -132,6 +132,82 @@ class SandboxProxyTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("ISOLATED_AND_SECRET_OK", res.stdout_lines)
 
+    def test_zero_timeout_disables_timer_and_sets_agy_print_timeout_0s(self) -> None:
+        from unittest import mock
+
+        from xreview.adapters.agy import AgyAdapter
+        from xreview.adapters.base import TurnRequest
+        from xreview.config import AppConfig, ConfigError, ReviewerConfig, load_config
+        from xreview.sandbox import SandboxRunResult
+
+        with tempfile.TemporaryDirectory(prefix="xr-to0-") as td:
+            root = Path(td)
+            cfg_path = root / "config.toml"
+            cfg_path.write_text("[policy]\ntimeout_seconds = 0\n", encoding="utf-8")
+            cfg = load_config(cfg_path)
+            self.assertEqual(cfg.policy.timeout_seconds, 0)
+
+            cfg_default = root / "default.toml"
+            cfg_default.write_text("", encoding="utf-8")
+            self.assertEqual(load_config(cfg_default).policy.timeout_seconds, 0)
+
+            cfg_bad = root / "bad.toml"
+            cfg_bad.write_text("[policy]\ntimeout_seconds = -5\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(cfg_bad)
+
+            # Running with timeout_s=0 must NOT immediately fire a 0s timer
+            tree, inputs, state = root / "tree", root / "inputs", root / "state"
+            tree.mkdir(); inputs.mkdir(); state.mkdir()
+            spec = SandboxSpec(
+                run_id="r0",
+                reviewer_name="rev",
+                tree_host_dir=tree,
+                inputs_host_dir=inputs,
+                state_host_dir=state,
+                harness_mounts=(),
+                command=("python3", "-c", "import time; time.sleep(0.05); print('NO_TIMEOUT_OK')"),
+                cwd_in_sandbox=str(tree),
+                timeout_s=0,
+                use_sandbox=False,
+            )
+            res = run_in_sandbox(spec, None, root / "raw.log", root / "proxy.log", capture_stdout=True)
+            self.assertFalse(res.timed_out)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("NO_TIMEOUT_OK", res.stdout_lines)
+
+            # AgyAdapter passes --print-timeout 0s and SandboxSpec.timeout_s=0 (NOT 0+30)
+            captured_spec: list[SandboxSpec] = []
+
+            def _fake_sb(sp, *args, **kwargs):
+                captured_spec.append(sp)
+                return SandboxRunResult(returncode=0, stdout_lines=[], stderr="", timed_out=False, duration_s=0.1, proxy_entries=[])
+
+            req = TurnRequest(
+                run_id="r0",
+                round_num=1,
+                reviewer=ReviewerConfig("carbon", "agy", "gemini-4-carbon-high", "gemini", "google"),
+                prompt="hi",
+                schema_host_path=inputs / "schema.json",
+                tree_host_dir=tree,
+                inputs_host_dir=inputs,
+                state_host_dir=state,
+                raw_log_path=root / "agy.jsonl",
+                proxy_log_path=root / "agy.proxy.log",
+                timeout_s=0,
+                allow_no_sandbox=True,
+            )
+            with (
+                mock.patch("xreview.adapters.agy._find_agy_binary", return_value=Path("/usr/bin/agy")),
+                mock.patch("xreview.adapters.agy.AgyAdapter.prepare_state", return_value=None),
+                mock.patch("xreview.adapters.agy.run_in_sandbox", side_effect=_fake_sb),
+            ):
+                AgyAdapter().run_turn(req, AppConfig(state_dir=root / "st"))
+            self.assertEqual(len(captured_spec), 1)
+            self.assertEqual(captured_spec[0].timeout_s, 0)
+            idx = captured_spec[0].command.index("--print-timeout")
+            self.assertEqual(captured_spec[0].command[idx + 1], "0s")
+
 
 if __name__ == "__main__":
     unittest.main()
