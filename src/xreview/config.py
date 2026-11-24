@@ -215,6 +215,13 @@ def safe_open_user_regular_file(path: Path, max_bytes: int | None = None) -> byt
         os.close(cur_fd)
 
 
+def agy_pool_for_reviewer(rc: ReviewerConfig) -> str:
+    """Return the Antigravity quota pool ('gemini' vs '3p') for an agy reviewer."""
+    if rc.model.strip().lower().startswith("gemini") or rc.family.strip().lower() == "gemini":
+        return "gemini"
+    return "3p"
+
+
 @dataclass(frozen=True)
 class ReviewerConfig:
     name: str
@@ -230,7 +237,12 @@ class ReviewerConfig:
 
     @property
     def plan_id(self) -> str:
-        return (self.plan or self.harness).strip().lower()
+        if self.plan:
+            return self.plan.strip().lower()
+        h = self.harness.strip().lower()
+        if h == "agy" and agy_pool_for_reviewer(self) != "gemini":
+            return "agy-3p"
+        return h
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -275,12 +287,16 @@ class PolicyConfig:
     auto_drop_exhausted: bool = True
     min_families_on_exhaustion: int = 2
     quota_preflight: bool = True
-    refresh_stale_quota: bool = True
-    quota_cache_max_age_seconds: int = 1800
+    live_quota_probe: bool = True
     timeout_seconds: int = 1200
     serialize_same_harness: dict[str, bool] = field(
         default_factory=lambda: {"codex": True, "agy": True, "claude": False}
     )
+
+    @property
+    def refresh_stale_quota(self) -> bool:
+        """Backward-compatible alias for `live_quota_probe`."""
+        return self.live_quota_probe
 
 
 @dataclass(frozen=True)
@@ -456,8 +472,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         auto_drop_exhausted=bool(pol_raw.get("auto_drop_exhausted", True)),
         min_families_on_exhaustion=int(pol_raw.get("min_families_on_exhaustion", 2)),
         quota_preflight=bool(pol_raw.get("quota_preflight", True)),
-        refresh_stale_quota=bool(pol_raw.get("refresh_stale_quota", True)),
-        quota_cache_max_age_seconds=int(pol_raw.get("quota_cache_max_age_seconds", 1800)),
+        live_quota_probe=bool(pol_raw.get("live_quota_probe", pol_raw.get("refresh_stale_quota", True))),
         timeout_seconds=int(pol_raw.get("timeout_seconds", 1200)),
         serialize_same_harness=ser_default,
     )

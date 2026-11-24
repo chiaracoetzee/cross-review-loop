@@ -21,6 +21,7 @@ from xreview.config import (
     AppConfig,
     ConfigError,
     ReviewerConfig,
+    agy_pool_for_reviewer,
     safe_open_user_regular_file,
     validate_repo_alias,
     validate_reviewer_name,
@@ -237,13 +238,26 @@ def init_run(
         implementor_family=implementor_family,
     )
 
+    # Check existing run_dir BEFORE running live quota probes so duplicate run_ids fail fast.
+    run_dir = resolve_trusted_run_dir(config, run_id)
+    if run_dir.exists():
+        raise ProtocolError(f"Run directory already exists: {run_dir}")
+
+    use_bwrap = bwrap_available()
+    if not use_bwrap and not no_sandbox:
+        raise ProtocolError(
+            "bubblewrap (bwrap) is not available. Install bwrap or pass --no-sandbox explicitly."
+        )
+    sandbox_mode = "bwrap" if (use_bwrap and not no_sandbox) else "none (explicit opt-in)"
+
     selected_reviewers = list(resolved.selected_reviewers)
     quota_adjustments: list[str] = []
+    quota_warnings: list[str] = []
     min_families_override: int | None = None
     eff_impl = implementor_family or config.implementor_family
 
     if config.policy.quota_preflight:
-        probe_warnings: list[str] = []
+        selected_plan_ids = {r.plan_id for r in selected_reviewers}
         if quota_inspector is not None:
             plan_statuses = quota_inspector(config)
         else:
@@ -251,23 +265,24 @@ def init_run(
             do_refresh = (
                 refresh_quota
                 if refresh_quota is not None
-                else (use_live and config.policy.refresh_stale_quota)
+                else (use_live and config.policy.live_quota_probe)
             )
             if do_refresh and use_live:
-                plan_statuses, probe_warnings = refresh_plan_quotas(
+                plan_statuses, quota_warnings = refresh_plan_quotas(
                     config,
-                    force=False,
+                    plan_ids=selected_plan_ids,
                     no_sandbox=no_sandbox,
                     include_host_codex_rollouts=True,
                 )
             else:
                 plan_statuses = inspect_plan_quotas(
                     config,
+                    plan_ids=selected_plan_ids,
                     include_host_codex_rollouts=use_live,
                 )
         q_adj = apply_pre_flight_quota_policy(selected_reviewers, config, plan_statuses)
         selected_reviewers = q_adj.reviewers
-        quota_adjustments = list(q_adj.notices) + probe_warnings
+        quota_adjustments = list(q_adj.notices)
         eff_min_fams = config.policy.min_families
         if q_adj.dropped_exhausted_plans and config.policy.auto_drop_exhausted:
             eff_min_fams = min(config.policy.min_families, max(2, config.policy.min_families_on_exhaustion))
@@ -276,15 +291,13 @@ def init_run(
         try:
             check_quorum(selected_reviewers, eff_min_fams, eff_impl)
         except PolicyViolation as exc:
-            detail = f" Quota adjustments: {'; '.join(quota_adjustments)}" if quota_adjustments else ""
-            raise PolicyViolation(f"{exc}{detail}") from exc
-
-    use_bwrap = bwrap_available()
-    if not use_bwrap and not no_sandbox:
-        raise ProtocolError(
-            "bubblewrap (bwrap) is not available. Install bwrap or pass --no-sandbox explicitly."
-        )
-    sandbox_mode = "bwrap" if (use_bwrap and not no_sandbox) else "none (explicit opt-in)"
+            details: list[str] = []
+            if quota_adjustments:
+                details.append(f"Quota adjustments: {'; '.join(quota_adjustments)}")
+            if quota_warnings:
+                details.append(f"Quota probe warnings: {'; '.join(quota_warnings)}")
+            suffix = (" " + " ".join(details)) if details else ""
+            raise PolicyViolation(f"{exc}{suffix}") from exc
 
     # Validate adapters and reviewer names BEFORE reserving run_dir (astra-69)
     reviewer_states: dict[str, ReviewerRuntimeState] = {}
@@ -332,6 +345,7 @@ def init_run(
                 implementor_family=eff_impl,
                 min_families_override=min_families_override,
                 quota_adjustments=quota_adjustments,
+                quota_warnings=quota_warnings,
                 reviewers=reviewer_states,
             )
             save_ledger(run_dir, ledger)
@@ -1339,7 +1353,10 @@ def _run_single_reviewer_round(
         session_id = rstate.session_id
 
     def _invoke(p: str, sid: str | None, suffix: str = "") -> TurnResult:
-        log = raw_log if not suffix else raw_dir / f"{rc.name}{suffix}.jsonl"
+        from xreview.watch import attempt_log_path
+
+        log = raw_log if not suffix else attempt_log_path(raw_dir, rc.name, suffix)
+        log.parent.mkdir(parents=True, exist_ok=True)
         prompt_fname = "PROMPT.md" if not suffix else f"PROMPT{suffix}.md"
         req = TurnRequest(
             run_id=ledger.run_id,
@@ -1808,6 +1825,7 @@ def run_round(
                                     exhausted_until=res.quota_resets_at if res.quota_exhausted else None,
                                     source="quota_cache",
                                     updated_at=time.time(),
+                                    pool=agy_pool_for_reviewer(rc) if rc.harness == "agy" else None,
                                 ),
                             )
                         except OSError:

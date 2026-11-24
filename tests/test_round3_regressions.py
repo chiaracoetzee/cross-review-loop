@@ -82,6 +82,7 @@ class Round3RegressionTests(unittest.TestCase):
                     ReviewerConfig("astra", "nonexistent_harness", "m1", "gpt", "openai"),
                     ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
                 ),
+                policy=PolicyConfig(min_families=2, quota_preflight=False),
             )
             with self.assertRaises(Exception):
                 init_run(bad_cfg, "r-fail", [RepoSpec("repo", repo)], "Fail init", no_sandbox=True)

@@ -17,13 +17,14 @@ reviewers = [
   # Extras: fast models with high reasoning effort.
   { name = "sol",      harness = "codex",  model = "gpt-6.2-sol",             effort = "xhigh", family = "gpt",    extra = true },
   { name = "hydrogen", harness = "agy",    model = "gemini-4-hydrogen-xhigh",                   family = "gemini", extra = true },
-  { name = "sonnet",   harness = "claude", model = "sonnet",                  effort = "max",   family = "claude", extra = true },
+  { name = "sonnet",   harness = "claude", model = "sonnet",                  effort = "xhigh", family = "claude", extra = true },
 ]
 
 [policy]
-credits = "never"              # stop at plan quota; never spend paid credits
+credits = "never"              # disable agy paid credits in CLI flags & stop on quota (keep Claude/ChatGPT overage off in account settings)
 min_families = 2               # refuse to start with fewer distinct model families
 soft_round_ceiling = 6         # pause and ask user after this many rounds
+live_quota_probe = true        # run live agy /usage + tiny Claude haiku check before init and on `xreview quota`
 fallback_to_extras_at = 0.75   # back out of heavyweight core models when a plan is >= 75% used
 auto_drop_exhausted = true     # drop 100%-exhausted plans at init (down to a 2-family hard floor)
 min_families_on_exhaustion = 2 # minimum distinct families when an exhausted plan is auto-dropped

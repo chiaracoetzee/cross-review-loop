@@ -374,7 +374,7 @@ class RunLedger:
     in_scope: str
     out_of_scope: str
     repos: list[RepoSpec]
-    ledger_version: int = 2
+    ledger_version: int = 3
     docs: list[str] = field(default_factory=list)
     run_tags: list[str] = field(default_factory=list)
     gates_lifted: list[GateLift] = field(default_factory=list)
@@ -395,6 +395,7 @@ class RunLedger:
     soft_ceiling_override: int | None = None
     min_families_override: int | None = None
     quota_adjustments: list[str] = field(default_factory=list)
+    quota_warnings: list[str] = field(default_factory=list)
     shed_plans: list[str] = field(default_factory=list)  # Permanently shed plans (astra-44)
     included_files: list[str] = field(default_factory=list)
     excluded_files: list[str] = field(default_factory=list)
@@ -453,6 +454,7 @@ class RunLedger:
             "soft_ceiling_override": self.soft_ceiling_override,
             "min_families_override": self.min_families_override,
             "quota_adjustments": list(self.quota_adjustments),
+            "quota_warnings": list(self.quota_warnings),
             "shed_plans": sorted(set(self.shed_plans)),
             "included_files": list(self.included_files),
             "excluded_files": list(self.excluded_files),
@@ -481,8 +483,27 @@ class RunLedger:
         all_ev_ids = [e.id for e in evidence_items]
         lver = int(data.get("ledger_version", 1))
         legacy_prov = lver < 2
+        raw_reviewers = {k: ReviewerRuntimeState.from_dict(v) for k, v in data.get("reviewers", {}).items()}
+        if lver < 3:
+            # Preserve pre-split legacy plan_id ("agy") on agy reviewers with no explicit plan
+            # so persisted `shed_plans: ["agy"]` continues matching consistently on old ledgers.
+            for rstate in raw_reviewers.values():
+                if rstate.config.harness == "agy" and rstate.config.plan is None:
+                    rc = rstate.config
+                    rstate.config = ReviewerConfig(
+                        name=rc.name,
+                        harness=rc.harness,
+                        model=rc.model,
+                        family=rc.family,
+                        vendor=rc.vendor,
+                        effort=rc.effort,
+                        extra=rc.extra,
+                        enabled=rc.enabled,
+                        serialize_group=rc.serialize_group,
+                        plan="agy",
+                    )
         return cls(
-            ledger_version=2,
+            ledger_version=3,
             run_id=str(data["run_id"]),
             created_at=str(data["created_at"]),
             artifact=str(data.get("artifact", "")),
@@ -511,12 +532,13 @@ class RunLedger:
             soft_ceiling_override=int(data["soft_ceiling_override"]) if data.get("soft_ceiling_override") is not None else None,
             min_families_override=int(data["min_families_override"]) if data.get("min_families_override") is not None else None,
             quota_adjustments=list(data.get("quota_adjustments", ())),
+            quota_warnings=list(data.get("quota_warnings", ())),
             shed_plans=list(data.get("shed_plans", ())),
             included_files=list(data.get("included_files", ())),
             excluded_files=list(data.get("excluded_files", ())),
             evidence=evidence_items,
             project_exclusions=list(data.get("project_exclusions", ())),
-            reviewers={k: ReviewerRuntimeState.from_dict(v) for k, v in data.get("reviewers", {}).items()},
+            reviewers=raw_reviewers,
             findings=[
                 Finding.from_dict(f, default_evidence_ids=all_ev_ids, legacy_provenance=legacy_prov)
                 for f in data.get("findings", ())
@@ -538,7 +560,7 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
         os.chmod(tmp_name, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
@@ -593,6 +615,8 @@ def render_ledger_markdown(ledger: RunLedger) -> str:
         lines.append("- **Gates lifted:** none")
     if ledger.quota_adjustments:
         lines.append("- **Quota adjustments:** " + "; ".join(ledger.quota_adjustments))
+    if ledger.quota_warnings:
+        lines.append("- **Quota probe warnings:** " + "; ".join(ledger.quota_warnings))
     if ledger.project_exclusions:
         lines.append(
             "- **Project file exclusions:** "

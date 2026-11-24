@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -29,6 +30,99 @@ def _find_claude_binary() -> Path:
     return Path(os.path.realpath(exe))
 
 
+def read_claude_oauth_token(config: AppConfig) -> str | None:
+    if os.environ.get("XREVIEW_CLAUDE_OAUTH_TOKEN"):
+        return os.environ["XREVIEW_CLAUDE_OAUTH_TOKEN"].strip()
+    src = config.auth.claude_token_file
+    if src is None:
+        candidate = Path.home() / ".config" / "xreview" / "claude-oauth-token"
+        if candidate.exists():
+            src = candidate
+    if src and src.exists():
+        return src.read_text(encoding="utf-8").strip()
+    return None
+
+
+def build_claude_env(cfg_dir_env: str, path_env: str) -> dict[str, str]:
+    return {
+        "CLAUDE_CONFIG_DIR": cfg_dir_env,
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+        "PATH": path_env,
+    }
+
+
+def build_claude_base_command(exe_path: str, model: str, effort: str | None = None) -> list[str]:
+    cmd = [
+        exe_path,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        model,
+        "--restricted",
+        "--strict-mcp-config",
+        "--permission-prompts",
+        "none",
+        "--disable-slash-commands",
+    ]
+    if effort:
+        cmd.extend(["--effort", effort])
+    return cmd
+
+
+def _finite_float(val: Any) -> float | None:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    f = float(val)
+    return f if math.isfinite(f) else None
+
+
+def parse_claude_rate_limit_info(
+    info: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], bool, float | None]:
+    """Parse a Claude `rate_limit_event.rate_limit_info` object into windows, rejected flag, resetsAt."""
+    windows: dict[str, dict[str, Any]] = {}
+    top_status = str(info.get("status", "")).lower()
+    rejected = top_status in ("rejected", "rate_limited", "exhausted")
+    resets_at = _finite_float(info.get("resetsAt"))
+    top_type = str(info.get("rateLimitType") or "").strip()
+    uwin = info.get("unifiedWindows")
+    if isinstance(uwin, dict):
+        for wname, wbody in uwin.items():
+            if not isinstance(wbody, dict):
+                continue
+            util = _finite_float(wbody.get("utilization"))
+            if util is None:
+                continue
+            ratio = max(0.0, util)
+            w_status = str(wbody.get("status", ""))
+            w_reset = _finite_float(wbody.get("resetsAt"))
+            w_exhausted = ratio >= 1.0 or w_status.lower() in ("rejected", "rate_limited", "exhausted", "blocked")
+            # Only inherit event-level resetsAt when rateLimitType matches this window (or is absent).
+            if w_reset is None and w_exhausted and resets_at is not None and (not top_type or top_type == str(wname)):
+                w_reset = resets_at
+            windows[str(wname)] = {
+                "name": str(wname),
+                "used_ratio": ratio,
+                "resets_at": w_reset,
+                "status": w_status,
+            }
+    # Also read finite top-level utilization keyed by rateLimitType when unifiedWindows didn't include it.
+    top_util = _finite_float(info.get("utilization"))
+    if top_util is not None:
+        top_name = top_type or "plan"
+        if top_name not in windows:
+            windows[top_name] = {
+                "name": top_name,
+                "used_ratio": max(0.0, top_util),
+                "resets_at": resets_at,
+                "status": top_status,
+            }
+    return windows, rejected, resets_at
+
+
 class ClaudeAdapter(HarnessAdapter):
     name = "claude"
     tested_version = TESTED_HARNESS_VERSIONS["claude"]
@@ -41,16 +135,7 @@ class ClaudeAdapter(HarnessAdapter):
         return m.group(1) if m else raw
 
     def _read_oauth_token(self, config: AppConfig) -> str | None:
-        if os.environ.get("XREVIEW_CLAUDE_OAUTH_TOKEN"):
-            return os.environ["XREVIEW_CLAUDE_OAUTH_TOKEN"].strip()
-        src = config.auth.claude_token_file
-        if src is None:
-            candidate = Path.home() / ".config" / "xreview" / "claude-oauth-token"
-            if candidate.exists():
-                src = candidate
-        if src and src.exists():
-            return src.read_text(encoding="utf-8").strip()
-        return None
+        return read_claude_oauth_token(config)
 
     def prepare_state(self, reviewer: ReviewerConfig, state_dir: Path, config: AppConfig) -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -99,39 +184,23 @@ class ClaudeAdapter(HarnessAdapter):
 
         schema_str = req.schema_host_path.read_text(encoding="utf-8")
 
-        cmd = [
-            exe_path,
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--model",
-            req.reviewer.model,
-            "--restricted",
-            "--tools",
-            "Read,Glob,Grep",
-            "--strict-mcp-config",
-            "--permission-prompts",
-            "none",
-            "--disable-slash-commands",
-            "--add-dir",
-            inputs_path,
-            "--json-schema",
-            schema_str,
-        ]
+        cmd = build_claude_base_command(exe_path, req.reviewer.model, req.reviewer.effort)
+        cmd.extend(
+            [
+                "--tools",
+                "Read,Glob,Grep",
+                "--add-dir",
+                inputs_path,
+                "--json-schema",
+                schema_str,
+            ]
+        )
         if docs_path:
             cmd.extend(["--add-dir", docs_path])
-        if req.reviewer.effort:
-            cmd.extend(["--effort", req.reviewer.effort])
         if req.session_id:
             cmd.extend(["--resume", req.session_id])
 
-        env = {
-            "CLAUDE_CONFIG_DIR": cfg_dir_env,
-            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-            "PATH": path_env,
-        }
+        env = build_claude_env(cfg_dir_env, path_env)
         # Pass OAuth token via secret_env (inherited pipe FD, NEVER in host bwrap argv! astra-18)
         secret_env: dict[str, str] = {}
         token = self._read_oauth_token(config)
@@ -184,21 +253,12 @@ class ClaudeAdapter(HarnessAdapter):
             if ev_type == "rate_limit_event":
                 info = ev.get("rate_limit_info")
                 if isinstance(info, dict):
-                    top_status = str(info.get("status", "")).lower()
-                    if top_status in ("rejected", "rate_limited", "exhausted"):
+                    wins, rej, r_at = parse_claude_rate_limit_info(info)
+                    if rej:
                         rate_limit_rejected = True
-                    if isinstance(info.get("resetsAt"), (int, float)):
-                        rate_limit_resets_at = float(info["resetsAt"])
-                    uwin = info.get("unifiedWindows")
-                    if isinstance(uwin, dict):
-                        for wname, wbody in uwin.items():
-                            if isinstance(wbody, dict) and isinstance(wbody.get("utilization"), (int, float)):
-                                rate_limit_windows[str(wname)] = {
-                                    "name": str(wname),
-                                    "used_ratio": float(wbody["utilization"]),
-                                    "resets_at": float(wbody["resetsAt"]) if isinstance(wbody.get("resetsAt"), (int, float)) else None,
-                                    "status": str(wbody.get("status", "")),
-                                }
+                    if r_at is not None:
+                        rate_limit_resets_at = r_at
+                    rate_limit_windows.update(wins)
             elif ev_type == "assistant":
                 msg = ev.get("message") or {}
                 for block in msg.get("content") or ():

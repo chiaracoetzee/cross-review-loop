@@ -20,12 +20,20 @@ A cross-vendor, multi-model code and design review loop built on subscription CL
 ```bash
 pip install -e . --no-build-isolation
 xreview doctor
-xreview quota --refresh
+xreview quota
 ```
 
-`xreview quota` inspects cached plan utilization (from Codex session rollouts and Claude `rate_limit_event` telemetry stored in `<state_dir>/quota_cache.json`). Passing `--refresh` (or letting `xreview init` auto-refresh when Claude's cache is missing or older than `quota_cache_max_age_seconds`, default 30 min; opt out with `--no-refresh-quota`) runs a tiny sandboxed `haiku` probe to fetch live Claude `five_hour`/`seven_day` utilization before choosing reviewers. During `xreview init`, plans at or above `fallback_to_extras_at` (default `0.75`) automatically back out of heavyweight core models and promote their cheaper extra models, and plans that are 100% exhausted are removed (down to a hard floor of `2` distinct model families including at least one non-implementor family), printing a notice and recording the adjustment in `LEDGER.md`.
-
 Copy `examples/config.toml` to `~/.config/xreview/config.toml` and customize your reviewers and optional environment profile (see `examples/profile.toml`).
+
+### Pre-flight quota tracking
+
+`xreview quota` and `xreview init` check plan utilization before selecting reviewers for a run (only plans belonging to the run's selected reviewers are probed during `init`; `xreview round` does not re-probe):
+
+- **Codex CLI:** reads the most recent local session rollout log under `~/.codex/sessions/.../rollout-*.jsonl` (zero API calls; usage consumed on another machine is not reflected until a local rollout updates).
+- **Antigravity (`agy`):** runs `agy --output-format json -p /usage` (zero tokens, `--settings` credit guard enabled, 45s timeout) in `bwrap` (unless `--no-sandbox`). Gemini models default to plan `agy` and third-party models on `agy` default to plan `agy-3p` so their separate Antigravity pools stay independent.
+- **Claude Code:** runs a minimal `haiku` turn (`--tools "" --system-prompt "Reply with ok." --effort low`, 30s timeout) in `bwrap` (unless `--no-sandbox`) to capture live 5-hour/weekly `rate_limit_event` windows, in parallel with `agy /usage`, and also captures `rate_limit_event` from every Claude review turn. Under `credits = "never"`, Claude plans already cached as exhausted are not re-probed until reset (unless `xreview quota --refresh` is passed); note that Anthropic's account-level "extra usage" toggle and ChatGPT credits have no CLI switch and must stay disabled in account settings to prevent paid overage.
+
+During `xreview init`, plans at or above `fallback_to_extras_at` (default `0.75`) automatically back out of heavyweight core models and promote their cheaper extra models, and plans that are 100% exhausted are removed (down to a hard floor of `2` distinct model families including at least one non-implementor family), printing a notice and recording the adjustment in `LEDGER.md`. Use `xreview quota --cached` or `xreview init --no-refresh-quota` to inspect cached/rollout data only without live probes, `xreview quota --refresh` to force a live check when `live_quota_probe = false`, or set `live_quota_probe = false` under `[policy]`.
 
 ### Authentication for isolated sandboxes
 
@@ -46,8 +54,10 @@ xreview init --repo . --base HEAD --artifact "Fix token refresh race" --implemen
 # 2. Classify any untracked files (if prompted)
 xreview classify <run-id> --include src/new_file.py --exclude notes.tmp
 
-# 3. Run Round 1 (blind)
+# 3. Run Round 1 (blind) — optionally watch each reviewer live in separate panes/tasks
 xreview round <run-id>
+xreview watch <run-id> --reviewer astra --round 1
+xreview watch <run-id> --reviewer carbon --round 1
 
 # 4. Inspect findings and record triage decisions
 xreview status <run-id>

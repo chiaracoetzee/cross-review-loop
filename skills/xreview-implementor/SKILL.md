@@ -54,15 +54,15 @@ Configure your implementor harness so lifting a gate always prompts the user:
    ```
    - Add `--tag security` if the work touches a security vulnerability.
    - Add `--repo <path>` once per repository when changes span multiple repos.
-   - If `init` reports `quota_adjustments` (backing out of heavyweight core models onto cheaper extras, or dropping an exhausted plan), always relay those notices to the user alongside the run summary. You can inspect current known plan quotas anytime with `xreview quota`.
+   - If `init` reports `quota_adjustments` (backing out of heavyweight core models onto cheaper extras, or dropping an exhausted plan), always relay those notices to the user alongside the run summary. You can inspect cached plan quotas anytime with `xreview quota --cached` (or run live `agy`/Claude probes with `xreview quota`).
    - Attach minimal, pseudonymized evidence files (if needed) with `xreview evidence <run-id> --file <path> --source "<cmd/query>" --tag <tag>`.
 
-2. **Run Round 1 (blind):**
+2. **Run Round 1 (blind) with live per-reviewer watch views:**
    ```bash
    xreview round <run-id>
    ```
    - If exit code is `2`, classify every listed untracked file with `xreview classify <run-id> --include <path> --exclude <path>` and re-run `xreview round <run-id>`.
-   - Run `xreview round` in the background if your harness supports it; a round typically takes 5–20 minutes.
+   - Run `xreview round <run-id>` in the background if your harness supports it (a round typically takes 3–15 minutes), and **also launch one background `xreview watch <run-id> --reviewer <name> --round <N>` task per active reviewer** (with a clear task summary like `"Watch <reviewer> Round <N>"`). That gives the user a separate, live-streaming progress card for each reviewer instead of one silent wait, and each watcher exits automatically when its reviewer finishes.
 
 3. **Triage every open finding (exit code `10`):**
    - Run `xreview status <run-id> --json` and inspect `ledger.json`.
@@ -87,6 +87,7 @@ Configure your implementor harness so lifting a gate always prompts the user:
    ```bash
    xreview round <run-id>
    ```
+   - Launch one background `xreview watch <run-id> --reviewer <name> --round <N>` per active reviewer alongside `xreview round <run-id>` so the user can watch each reviewer live.
    - Watch for `HINT (overlapping fix lines)`: verify you did not undo an earlier fix.
    - Repeat steps 3–4 until:
      - **Exit `0` (converged):** present `LEDGER.md` (and any escalated or unverified items) to the user alongside your commit proposal.

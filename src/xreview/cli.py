@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import secrets
 import shutil
@@ -37,6 +38,7 @@ from xreview.protocol import (
 )
 from xreview.sandbox import SandboxUnavailableError
 from xreview.snapshot import RepoSpec, SnapshotError, UnclassifiedFilesError, check_unclassified_files
+from xreview.watch import watch_reviewer
 
 GATE_ASK_PATTERNS: tuple[str, ...] = (
     "Bash(xreview *--allow*)",
@@ -116,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--allow", action="append", default=[], help="Allow vendor(s) for an evidence tag: <tag>=<v1,v2>")
     p_init.add_argument("--implementor-family", default=None, help="Model family of the implementor (e.g., claude, gemini, gpt)")
     p_init.add_argument("--no-sandbox", action="store_true", help="Explicit opt-in to run without bubblewrap sandbox")
-    p_init.add_argument("--no-refresh-quota", action="store_true", help="Skip live quota refresh probe during init")
+    p_init.add_argument("--no-refresh-quota", action="store_true", help="Skip live agy/Claude quota checks during init (use cached/rollout data only)")
     p_init.add_argument("--json", action="store_true", help="Output JSON")
 
     # classify
@@ -175,6 +177,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_led = sub.add_parser("ledger", help="Print rendered LEDGER.md for a run")
     p_led.add_argument("run_id")
 
+    # watch
+    p_w = sub.add_parser("watch", help="Stream a single reviewer's live progress log for a round")
+    p_w.add_argument("run_id")
+    p_w.add_argument("--reviewer", required=True, help="Reviewer name to watch (one watcher per reviewer)")
+    p_w.add_argument("--round", dest="round_num", type=int, default=None, help="Round number (default: in-progress or next round)")
+    p_w.add_argument("--no-follow", action="store_true", help="Print existing events and exit immediately without waiting")
+    p_w.add_argument("--poll-interval", type=float, default=0.5, help="Polling interval in seconds (default: 0.5)")
+    p_w.add_argument("--start-timeout", type=float, default=60.0, help="Max seconds to wait for initial log before exiting (default: 60)")
+    p_w.add_argument("--timeout", type=float, default=None, help="Optional overall max seconds to watch before exiting")
+
     # clean
     p_cln = sub.add_parser("clean", help="Delete reviewer state folders and run folder")
     p_cln.add_argument("run_id")
@@ -195,9 +207,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--json", action="store_true", help="Output JSON")
 
     # quota
-    p_q = sub.add_parser("quota", help="Show latest known plan quotas and automatic fallback actions")
-    p_q.add_argument("--refresh", action="store_true", help="Run a tiny sandboxed haiku probe to refresh live Claude quota")
-    p_q.add_argument("--no-sandbox", action="store_true", help="Run refresh probe without bwrap sandbox (explicit opt-in)")
+    p_q = sub.add_parser("quota", help="Show plan quotas and automatic fallback actions")
+    q_mode = p_q.add_mutually_exclusive_group()
+    q_mode.add_argument("--cached", action="store_true", help="Read cached/rollout quota data only (skip live agy/Claude probes)")
+    q_mode.add_argument("--refresh", action="store_true", help="Force live agy/Claude quota checks even if live_quota_probe is false")
+    p_q.add_argument("--no-sandbox", action="store_true", help="Run live quota checks without bwrap sandbox (explicit opt-in)")
     p_q.add_argument("--json", action="store_true", help="Output JSON")
 
     return p
@@ -242,10 +256,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "quota":
             now_ts = datetime.now(timezone.utc).timestamp()
             probe_warnings: list[str] = []
-            if args.refresh:
+            do_live = args.refresh or (config.policy.live_quota_probe and not args.cached)
+            if do_live:
+                if not args.json:
+                    print("Checking plan quotas...", file=sys.stderr)
                 statuses, probe_warnings = refresh_plan_quotas(
                     config,
-                    force=True,
+                    force=bool(args.refresh),
                     no_sandbox=args.no_sandbox,
                     now_ts=now_ts,
                 )
@@ -339,6 +356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Do NOT call .resolve() on --doc before symlink validation (astra-6)
             docs = [Path(os.path.expanduser(d)) for d in args.doc]
             rev_subset = _parse_reviewer_list(args.reviewers)
+            if config.policy.quota_preflight and config.policy.live_quota_probe and not args.no_refresh_quota and not args.json:
+                print("Checking plan quotas...", file=sys.stderr)
             run_dir, ledger = init_run(
                 config=config,
                 run_id=run_id,
@@ -364,6 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "sandbox_mode": ledger.sandbox_mode,
                 "gates_lifted": [g.to_dict() for g in ledger.gates_lifted],
                 "quota_adjustments": list(ledger.quota_adjustments),
+                "quota_warnings": list(ledger.quota_warnings),
                 "version_warnings": {
                     k: v.version_warning for k, v in ledger.reviewers.items() if v.version_warning
                 },
@@ -372,12 +392,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(out, indent=2))
                 for note in ledger.quota_adjustments:
                     print(f"NOTICE (quota): {note}", file=sys.stderr)
+                for warn in ledger.quota_warnings:
+                    print(f"WARNING (quota): {warn}", file=sys.stderr)
             else:
                 print(f"Initialized run {ledger.run_id} at {run_dir}")
                 print(f"Reviewers: {', '.join(out['reviewers'])}")
                 print(f"Sandbox:   {ledger.sandbox_mode}")
                 for note in ledger.quota_adjustments:
                     print(f"NOTICE (quota): {note}", file=sys.stderr)
+                for warn in ledger.quota_warnings:
+                    print(f"WARNING (quota): {warn}", file=sys.stderr)
                 if out["version_warnings"]:
                     for r, w in out["version_warnings"].items():
                         print(f"WARNING ({r}): {w}", file=sys.stderr)
@@ -521,6 +545,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             ledger = load_ledger(run_dir)
             print(render_ledger_markdown(ledger))
             return 0
+
+        if args.command == "watch":
+            poll_iv = float(args.poll_interval)
+            if not math.isfinite(poll_iv) or poll_iv <= 0:
+                raise ConfigError("--poll-interval must be a positive finite number")
+            start_to = float(args.start_timeout)
+            if not math.isfinite(start_to) or start_to < 0:
+                raise ConfigError("--start-timeout must be a non-negative finite number")
+            total_to = None
+            if args.timeout is not None:
+                total_to = float(args.timeout)
+                if not math.isfinite(total_to) or total_to <= 0:
+                    raise ConfigError("--timeout must be a positive finite number")
+            try:
+                return watch_reviewer(
+                    run_dir,
+                    args.reviewer,
+                    round_num=args.round_num,
+                    follow=not args.no_follow,
+                    poll_interval=max(0.05, poll_iv),
+                    start_timeout_s=start_to,
+                    timeout_s=total_to,
+                )
+            except KeyboardInterrupt:
+                return 0
 
         if args.command == "hooks":
             results = run_pending_hooks(
