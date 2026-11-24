@@ -76,6 +76,7 @@ class RepoRoundSnapshot:
     tree_sha: str
     submodules: dict[str, tuple[str, str, str]] = field(default_factory=dict)  # sp -> (base_sha, snap_sha, tree_sha)
     submodule_git_dirs: dict[str, str] = field(default_factory=dict)  # sp -> verified git_dir (astra-20)
+    submodule_obj_dirs: dict[str, str] = field(default_factory=dict)  # sp -> run-local objects dir (F-020)
     included_submodule_host_paths: list[str] = field(default_factory=list)
     excluded_submodules: list[str] = field(default_factory=list)
     project_exclusions: list[str] = field(default_factory=list)
@@ -92,6 +93,7 @@ class RepoRoundSnapshot:
             "tree_sha": self.tree_sha,
             "submodules": {k: list(v) for k, v in self.submodules.items()},
             "submodule_git_dirs": dict(self.submodule_git_dirs),
+            "submodule_obj_dirs": dict(self.submodule_obj_dirs),
             "included_submodule_host_paths": list(self.included_submodule_host_paths),
             "excluded_submodules": list(self.excluded_submodules),
             "project_exclusions": list(self.project_exclusions),
@@ -116,6 +118,7 @@ class RepoRoundSnapshot:
             tree_sha=str(data["tree_sha"]),
             submodules=subs,
             submodule_git_dirs={k: str(v) for k, v in data.get("submodule_git_dirs", {}).items()},
+            submodule_obj_dirs={k: str(v) for k, v in data.get("submodule_obj_dirs", {}).items()},
             included_submodule_host_paths=list(data.get("included_submodule_host_paths", ())),
             excluded_submodules=list(data.get("excluded_submodules", ())),
             project_exclusions=list(data.get("project_exclusions", ())),
@@ -246,8 +249,10 @@ def _git(
     return res
 
 
-def resolve_commit_sha(repo_path: Path, rev: str) -> str:
-    """Resolve and pin a git revision to its 40-char commit SHA (astra-67)."""
+def resolve_commit_sha(repo_path: Path, rev: str, *, allow_empty_tree: bool = False) -> str:
+    """Resolve and pin a git revision to its 40-char commit SHA (or EMPTY_TREE_SHA for root commits, astra-67)."""
+    if allow_empty_tree and rev.strip() in (EMPTY_TREE_SHA, "EMPTY", "empty"):
+        return EMPTY_TREE_SHA
     return _git(["rev-parse", f"{rev}^{{commit}}"], cwd=repo_path).stdout.strip()
 
 
@@ -599,7 +604,7 @@ def _snapshot_single_git_dir(
     objects_dir.mkdir(parents=True, exist_ok=True)
     real_gd, common_gd = _git_dirs(repo_path)
     base_sha = (
-        _git(["rev-parse", f"{base_rev}^{{commit}}"], cwd=repo_path).stdout.strip()
+        resolve_commit_sha(repo_path, base_rev, allow_empty_tree=True)
         if base_rev is not None
         else EMPTY_TREE_SHA
     )
@@ -870,21 +875,22 @@ def _diff_docs_dirs(prev_docs: Path | None, cur_docs: Path | None) -> bytes:
         p_b = cur_files.get(name)
         if p_a and p_b and p_a.read_bytes() == p_b.read_bytes():
             continue
-        arg_a = str(p_a) if p_a else null_dev
-        arg_b = str(p_b) if p_b else null_dev
+        arg_a = str(p_a.resolve()) if p_a else null_dev
+        arg_b = str(p_b.resolve()) if p_b else null_dev
         res = subprocess.run(
             ["git", *_SAFE_GIT_CONFIG_ARGS, "diff", "--no-index", "--no-ext-diff", "--no-textconv", "--binary", "--", arg_a, arg_b],
             capture_output=True,
             check=False,
         )
         if res.stdout:
-            # Rewrite absolute temp paths in header lines to clean docs/<name> labels using fsencode
+            # git diff --no-index /abs/a /abs/b emits a/abs/a and b/abs/b; replace /abs/... with /docs/<name>
+            # so headers become a/docs/<name> and b/docs/<name> for parse_diff_line_ranges (F-012)
             out = res.stdout
             name_b = os.fsencode(name)
             if p_a:
-                out = out.replace(os.fsencode(str(p_a)), b"docs/" + name_b)
+                out = out.replace(os.fsencode(arg_a), b"/docs/" + name_b)
             if p_b:
-                out = out.replace(os.fsencode(str(p_b)), b"docs/" + name_b)
+                out = out.replace(os.fsencode(arg_b), b"/docs/" + name_b)
             parts.append(out)
     return b"\n".join(parts)
 
@@ -919,6 +925,15 @@ def create_round_snapshot(
     if final_tree_dir.exists():
         raise SnapshotError(f"Round tree already exists (never reuse a round tree): {final_tree_dir}")
 
+    # Clean up partial publish artifacts or leftover staging dirs from an earlier crash before tree publish (F-011)
+    if round_dir.is_dir():
+        for orphan in (final_docs_dir, final_diffs_dir):
+            if orphan.exists() or orphan.is_symlink():
+                shutil.rmtree(orphan, ignore_errors=True)
+        for child in round_dir.iterdir():
+            if child.name.startswith(".staging_"):
+                shutil.rmtree(child, ignore_errors=True)
+
     round_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = round_dir / f".staging_{time.time_ns()}_{os.getpid()}"
     staging_tree = staging_dir / "tree"
@@ -947,7 +962,7 @@ def create_round_snapshot(
                 pref = repo.name + "/"
                 return p[len(pref):] if p.startswith(pref) else None
 
-            base_sha = _git(["rev-parse", f"{repo.base_rev}^{{commit}}"], cwd=repo.path).stdout.strip()
+            base_sha = resolve_commit_sha(repo.path, repo.base_rev, allow_empty_tree=True)
             base_subs = _discover_submodules(repo.path, base_sha, _obj_env(objs_dir, common_gd))
             if repo.target_rev is not None:
                 target_subs = _discover_submodules(repo.path, repo.target_rev, _obj_env(objs_dir, common_gd))
@@ -991,6 +1006,7 @@ def create_round_snapshot(
             sub_git_dirs: dict[str, str] = {}
             sub_obj_dirs: dict[str, Path] = {}
             sub_host_dirs: dict[str, Path] = {}
+            present_excluded_subs: dict[str, tuple[Path, Path, str | None]] = {}
             excluded_subs: list[str] = []
             repo_proj_exclusions: list[str] = []
             included_sub_host_paths: list[str] = []
@@ -1068,6 +1084,11 @@ def create_round_snapshot(
                         has_included_files=sub_has_inc,
                     )
                     if not changed and (full_sp in prof_excl or full_sp in proj_excl_subs):
+                        present_excluded_subs[full_sp] = (
+                            parent_path / sp,
+                            parent_objs / "submodules" / sp,
+                            b_sha,
+                        )
                         reason = "profile" if full_sp in prof_excl else ".xreview.toml"
                         excluded_subs.append(f"{full_sp} ({reason})")
                         if full_sp in proj_excl_subs and full_sp not in prof_excl:
@@ -1249,11 +1270,43 @@ def create_round_snapshot(
                         if sub_rd:
                             hdr = b"\n# Submodule " + os.fsencode(sp_pref) + f" round diff ({prev_sc[:8]}..{sc[:8]})\n".encode("ascii")
                             r_diff += hdr + sub_rd
-                # Emit content diff for submodules deleted since previous round using persisted git dirs (astra-20)
+                # Emit content diff for submodules deleted OR reverted-to-excluded since previous round (astra-20, F-007)
                 for prev_sp, (_pb, prev_sc, _pt) in sorted(prev_repo_snap.submodules.items()):
                     if prev_sp not in sub_records:
                         sp_pref = f"{repo.name}/{prev_sp}" if multi else prev_sp
-                        sub_objs = objs_dir / "submodules" / prev_sp
+                        sub_objs = (
+                            Path(prev_repo_snap.submodule_obj_dirs[prev_sp])
+                            if prev_sp in prev_repo_snap.submodule_obj_dirs
+                            else (objs_dir / "submodules" / prev_sp)
+                        )
+                        if prev_sp in present_excluded_subs or any(
+                            prev_sp.startswith(ex + "/") for ex in present_excluded_subs
+                        ):
+                            if prev_sp in present_excluded_subs:
+                                ex_host, ex_objs, ex_base = present_excluded_subs[prev_sp]
+                                target_revert = ex_base or _pb
+                                if target_revert and prev_sc != target_revert:
+                                    rev_rd = _diff_commits_bytes(ex_host, ex_objs, prev_sc, target_revert, prefix=sp_pref)
+                                    if rev_rd:
+                                        r_diff += (
+                                            b"\n# Submodule "
+                                            + os.fsencode(sp_pref)
+                                            + f" reverted to base ({prev_sc[:8]}..{target_revert[:8]})\n".encode("ascii")
+                                            + rev_rd
+                                        )
+                            else:
+                                # Nested submodule beneath an excluded parent submodule that reverted to base (F-020)
+                                cand_gd = _resolve_deleted_sub_git_dir(repo.path, common_gd, prev_sp, prev_sp, base_gitmodules_bytes)
+                                if cand_gd is not None and _pb and prev_sc != _pb:
+                                    rev_rd = _diff_bare_git_dir_bytes(cand_gd, sub_objs, prev_sc, _pb, prefix=sp_pref)
+                                    if rev_rd:
+                                        r_diff += (
+                                            b"\n# Submodule "
+                                            + os.fsencode(sp_pref)
+                                            + f" reverted to base ({prev_sc[:8]}..{_pb[:8]})\n".encode("ascii")
+                                            + rev_rd
+                                        )
+                            continue
                         cand_gd = _resolve_deleted_sub_git_dir(repo.path, common_gd, prev_sp, prev_sp, base_gitmodules_bytes)
                         del_rd = (
                             _diff_bare_git_dir_bytes(cand_gd, sub_objs, prev_sc, EMPTY_TREE_SHA, prefix=sp_pref)
@@ -1276,6 +1329,7 @@ def create_round_snapshot(
                 tree_sha=tree_sha,
                 submodules=sub_records,
                 submodule_git_dirs=sub_git_dirs,
+                submodule_obj_dirs={k: str(v) for k, v in sub_obj_dirs.items()},
                 included_submodule_host_paths=included_sub_host_paths,
                 excluded_submodules=excluded_subs,
                 project_exclusions=repo_proj_exclusions,

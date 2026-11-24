@@ -14,6 +14,7 @@ from xreview.adapters.base import (
     TurnRequest,
     TurnResult,
     detect_quota_exhausted,
+    detect_resume_failed,
     parse_json_from_text,
 )
 from xreview.config import TESTED_HARNESS_VERSIONS, AppConfig, ReviewerConfig
@@ -107,6 +108,9 @@ class AgyAdapter(HarnessAdapter):
                 "and point auth.agy_token_file to <auth_dir>/.gemini/antigravity-cli/antigravity-oauth-token."
             )
         token_bytes = src.read_bytes()
+        # Both credit switches are distinct settings in agy 1.5.15:
+        # `userSettings.useAiCredits` lives in ~/.gemini/config/config.json, while
+        # `useG1Credits` lives in settings.json / `--settings` (passed on every turn).
         use_credits = config.policy.credits != "never"
         cfg_bytes = json.dumps(
             {"userSettings": {"useAiCredits": use_credits, "enableTerminalSandbox": True}},
@@ -283,11 +287,15 @@ class AgyAdapter(HarnessAdapter):
         succeeded = sb_res.returncode == 0 and not sb_res.timed_out and saw_result and result_status == "SUCCESS"
         reply = (structured_output or parse_json_from_text(response_text)) if succeeded else None
 
-        diag_err = "\n".join(stream_errors + ([sb_res.stderr] if sb_res.stderr else []))
+        err_only = "\n".join(stream_errors + ([sb_res.stderr] if sb_res.stderr else []))
+        diag_err = err_only
+        if not succeeded and response_text:
+            diag_err += ("\n" if diag_err else "") + response_text
         quota = not succeeded and detect_quota_exhausted(diag_err)
         malformed = bool(succeeded and reply is None)
+        # Only inspect harness error diagnostics (never model response_text prose!) for resume failures (F-023)
         resume_failed = bool(
-            req.session_id and not succeeded and not quota and not sb_res.timed_out
+            req.session_id and not succeeded and not quota and not sb_res.timed_out and detect_resume_failed(err_only)
         )
         error = None
         if sb_res.timed_out:

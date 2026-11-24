@@ -14,6 +14,7 @@ from xreview.adapters.base import (
     TurnRequest,
     TurnResult,
     detect_quota_exhausted,
+    detect_resume_failed,
     parse_json_from_text,
 )
 from xreview.config import TESTED_HARNESS_VERSIONS, AppConfig, ReviewerConfig
@@ -212,13 +213,14 @@ class ClaudeAdapter(HarnessAdapter):
         reply = (structured_output or last_structured_tool_input or parse_json_from_text(result_text)) if succeeded else None
 
         # Only scan error diagnostics (never a successful review's text!) for quota exhaustion (astra-37)
-        diag_err = "\n".join(stream_errors + ([sb_res.stderr] if sb_res.stderr else []))
+        err_only = "\n".join(stream_errors + ([sb_res.stderr] if sb_res.stderr else []))
+        diag_err = err_only
         if is_error_result and result_text:
-            diag_err += "\n" + result_text
+            diag_err += ("\n" if diag_err else "") + result_text
         quota = not succeeded and detect_quota_exhausted(diag_err)
         malformed = bool(succeeded and reply is None)
         resume_failed = bool(
-            req.session_id and not succeeded and not quota and not sb_res.timed_out
+            req.session_id and not succeeded and not quota and not sb_res.timed_out and detect_resume_failed(err_only)
         )
 
         error = None

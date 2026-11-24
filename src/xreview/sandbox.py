@@ -81,8 +81,12 @@ def resolve_and_connect_public(host: str, port: int, timeout: float = 30.0) -> s
 
 
 class _VendorProxyHandler(socketserver.StreamRequestHandler):
+    # Unbuffered rfile so post-CONNECT TLS bytes are never over-read before _relay (F-003, F-018)
+    rbufsize = 0
+
     def handle(self) -> None:
         try:
+            self.connection.settimeout(30.0)
             raw_line = self.rfile.readline(65536)
             if not raw_line:
                 return
@@ -161,17 +165,19 @@ class _VendorProxyHandler(socketserver.StreamRequestHandler):
             try:
                 self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 self.wfile.flush()
-                self._relay(self.connection, upstream)
+                self.connection.settimeout(None)
+                upstream.settimeout(None)
+                self._relay(self.connection, upstream, idle_timeout=self.server.idle_timeout)
             finally:
                 upstream.close()
         except OSError:
             pass
 
     @staticmethod
-    def _relay(sock_a: socket.socket, sock_b: socket.socket) -> None:
+    def _relay(sock_a: socket.socket, sock_b: socket.socket, idle_timeout: float = 300.0) -> None:
         sockets = [sock_a, sock_b]
         while True:
-            readable, _, _ = select.select(sockets, [], [], 300)
+            readable, _, _ = select.select(sockets, [], [], idle_timeout)
             if not readable:
                 break
             for s in readable:
@@ -198,10 +204,12 @@ class _UnixVendorProxyServer(socketserver.ThreadingMixIn, socketserver.UnixStrea
         allowlist: tuple[str, ...],
         allowed_ports: tuple[int, ...] = (443,),
         log_path: Path | None = None,
+        idle_timeout: float = 300.0,
     ) -> None:
         self.allowlist = allowlist
         self.allowed_ports = allowed_ports
         self.log_path = log_path
+        self.idle_timeout = idle_timeout
         self.entries: list[tuple[str, str, int, bool]] = []
         self._lock = threading.Lock()
         super().__init__(sock_path, _VendorProxyHandler)
@@ -225,11 +233,13 @@ class VendorProxy:
         allowlist: tuple[str, ...],
         allowed_ports: tuple[int, ...] = (443,),
         log_path: Path | None = None,
+        idle_timeout: float = 300.0,
     ) -> None:
         self.socket_path = socket_path
         self.allowlist = allowlist
         self.allowed_ports = allowed_ports
         self.log_path = log_path
+        self.idle_timeout = idle_timeout
         self._server: _UnixVendorProxyServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -245,6 +255,7 @@ class VendorProxy:
             allowlist=self.allowlist,
             allowed_ports=self.allowed_ports,
             log_path=self.log_path,
+            idle_timeout=self.idle_timeout,
         )
         os.chmod(self.socket_path, 0o600)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -263,6 +274,7 @@ _PY_PROXY_BRIDGE = r"""
 import os, select, socket, sys, threading
 sock_path = sys.argv[1]
 port = int(sys.argv[2])
+idle_timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 300.0
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", port))
@@ -271,7 +283,7 @@ srv.listen(64)
 def pipe(a, b):
     try:
         while True:
-            r, _, _ = select.select([a, b], [], [], 300)
+            r, _, _ = select.select([a, b], [], [], idle_timeout)
             if not r:
                 break
             for s in r:
@@ -356,12 +368,28 @@ def _write_synthetic_etc(etc_dir: Path) -> None:
     (etc_dir / "nsswitch.conf").write_text("hosts: files\n", encoding="utf-8")
 
 
+def _sandbox_accessible_socat() -> str | None:
+    """Return a socat path guaranteed to exist inside the allowlist bwrap mount, or None (F-006, F-014)."""
+    found = shutil.which("socat")
+    if not found:
+        return None
+    try:
+        resolved = Path(found).resolve()
+    except OSError:
+        return None
+    mounted_prefixes = ("/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/")
+    if any(str(resolved).startswith(p) for p in mounted_prefixes) and resolved.is_file():
+        return str(resolved)
+    return None
+
+
 def build_bwrap_command(
     spec: SandboxSpec,
     proxy_socket_host: Path,
     etc_dir: Path,
     use_socat: bool = True,
     secret_fd: int | None = None,
+    socat_path: str | None = None,
 ) -> list[str]:
     cmd: list[str] = ["bwrap"]
     for sys_dir in ("/usr", "/lib", "/lib64", "/bin", "/sbin"):
@@ -434,13 +462,18 @@ def build_bwrap_command(
         cmd.extend(["--setenv", k, v])
 
     target_cmd = " ".join(shlex.quote(a) for a in spec.command)
+    bridge_idle = max(300, int(spec.timeout_s))
     if use_socat:
+        socat_exe = shlex.quote(socat_path or "/usr/bin/socat")
         bridge_start = (
-            "socat TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork "
+            f"{socat_exe} TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork "
             "UNIX-CONNECT:/run/xreview/proxy.sock 2>/dev/null &"
         )
     else:
-        bridge_start = f"python3 -c {shlex.quote(_PY_PROXY_BRIDGE)} /run/xreview/proxy.sock 18080 &"
+        bridge_start = (
+            f"python3 -c {shlex.quote(_PY_PROXY_BRIDGE)} "
+            f"/run/xreview/proxy.sock 18080 {bridge_idle} &"
+        )
 
     secret_loader = ""
     if secret_fd is not None:
@@ -452,11 +485,13 @@ def build_bwrap_command(
         f"{bridge_start}\n"
         "BRIDGE_PID=$!\n"
         'trap "kill $BRIDGE_PID 2>/dev/null || true" EXIT\n'
-        "python3 -c 'import socket,time\n"
+        "python3 -c 'import socket,sys,time\n"
         "for _ in range(100):\n"
         "  try:\n"
-        "    s=socket.create_connection((\"127.0.0.1\",18080),0.1); s.close(); break\n"
-        "  except OSError: time.sleep(0.02)'\n"
+        "    s=socket.create_connection((\"127.0.0.1\",18080),0.1); s.close(); sys.exit(0)\n"
+        "  except OSError: time.sleep(0.02)\n"
+        "sys.stderr.write(\"[xreview] sandbox proxy bridge failed to bind 127.0.0.1:18080\\n\")\n"
+        "sys.exit(97)' || exit 97\n"
         f"cd {shlex.quote(spec.cwd_in_sandbox)}\n"
         f"{target_cmd}\n"
     )
@@ -469,18 +504,19 @@ def _format_secret_exports(secret_env: dict[str, str]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _kill_group(proc: subprocess.Popen[str]) -> None:
-    """Terminate and unconditionally SIGKILL the entire process group (including descendants)."""
+def _kill_group(proc: subprocess.Popen[str], *, already_exited: bool = False) -> None:
+    """Terminate and SIGKILL the process group while proc.pid is still pinned (unreaped, F-005, F-015, F-022).
+
+    Never calls proc.wait() so leader reaping stays exclusively with the main thread after waitid.
+    """
+    if proc.returncode is not None:
+        # Leader PID was already reaped; never signal a potentially recycled PGID (F-015)
+        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except OSError:
         pass
-    try:
-        proc.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        pass
-    # Always SIGKILL the whole process group even if the leader already exited,
-    # so surviving descendants holding stdout/stderr pipes cannot block readers.
+    time.sleep(0.05 if already_exited else 0.2)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
@@ -517,15 +553,29 @@ def run_in_sandbox(
     stdout_lines: list[str] = []
     stderr_chunks: list[str] = []
     stderr_bytes = 0
+    stderr_lock = threading.Lock()
     timed_out = False
 
+    def _append_stderr(text: str) -> None:
+        nonlocal stderr_bytes
+        with stderr_lock:
+            if stderr_bytes < _MAX_STDERR_BYTES:
+                keep = text[: _MAX_STDERR_BYTES - stderr_bytes]
+                stderr_chunks.append(keep)
+                stderr_bytes += len(keep)
+
     def _stream_proc(proc: subprocess.Popen[str]) -> int:
-        nonlocal timed_out, stderr_bytes
+        nonlocal timed_out
+        state_lock = threading.Lock()
+        finished = False
 
         def _mark_timeout() -> None:
             nonlocal timed_out
-            timed_out = True
-            _kill_group(proc)
+            with state_lock:
+                if finished:
+                    return
+                timed_out = True
+                _kill_group(proc)
 
         timer = threading.Timer(spec.timeout_s, _mark_timeout)
         timer.daemon = True
@@ -547,7 +597,6 @@ def run_in_sandbox(
                     pass
 
         def _read_stderr() -> None:
-            nonlocal stderr_bytes
             if proc.stderr is None:
                 return
             try:
@@ -555,10 +604,7 @@ def run_in_sandbox(
                     chunk = proc.stderr.read(8192)
                     if not chunk:
                         break
-                    if stderr_bytes < _MAX_STDERR_BYTES:
-                        keep = chunk[: _MAX_STDERR_BYTES - stderr_bytes]
-                        stderr_chunks.append(keep)
-                        stderr_bytes += len(keep)
+                    _append_stderr(chunk)
             except OSError:
                 pass
 
@@ -566,6 +612,30 @@ def run_in_sandbox(
         err_thread = threading.Thread(target=_read_stderr, daemon=True)
         in_thread.start()
         err_thread.start()
+
+        # Monitor leader exit concurrently via waitid(WNOWAIT) so descendants holding stdout OR stderr
+        # open in --no-sandbox mode are cleaned up immediately after leader exit without blocking
+        # readline() until timeout, while keeping proc.pid pinned until proc.wait() reaps it (F-005, F-022).
+        waitid_fn = getattr(os, "waitid", None)
+        has_waitid = waitid_fn is not None and hasattr(os, "WNOWAIT")
+
+        def _watch_leader_exit() -> None:
+            nonlocal finished
+            if not has_waitid:
+                return
+            try:
+                waitid_fn(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+            except (ChildProcessError, OSError):
+                return
+            with state_lock:
+                if not finished:
+                    finished = True
+                    timer.cancel()
+                    _kill_group(proc, already_exited=True)
+
+        watch_thread = threading.Thread(target=_watch_leader_exit, daemon=True)
+        if has_waitid:
+            watch_thread.start()
 
         try:
             assert proc.stdout is not None
@@ -575,22 +645,64 @@ def run_in_sandbox(
                     if not line:
                         break
                     log_fh.write(line)
+                    if len(line) >= _MAX_EVENT_LINE_CHARS and not line.endswith("\n"):
+                        # Drain oversized event line to log without passing split fragments to parsers (F-004, F-016)
+                        dropped_len = len(line)
+                        while True:
+                            extra = proc.stdout.readline(_MAX_EVENT_LINE_CHARS)
+                            if not extra:
+                                break
+                            log_fh.write(extra)
+                            dropped_len += len(extra)
+                            if extra.endswith("\n"):
+                                break
+                        log_fh.flush()
+                        _append_stderr(
+                            f"\n[xreview] dropped oversized stdout event line ({dropped_len} chars > {_MAX_EVENT_LINE_CHARS})\n"
+                        )
+                        continue
                     log_fh.flush()
                     stripped = line.rstrip("\r\n")
                     if capture_stdout:
                         stdout_lines.append(stripped)
                     if on_stdout_line is not None:
                         on_stdout_line(stripped)
+
+            if has_waitid:
+                watch_thread.join(timeout=5)
+            with state_lock:
+                if not finished:
+                    finished = True
+                    timer.cancel()
+                    _kill_group(proc, already_exited=True)
             proc.wait()
-            err_thread.join()
+            err_thread.join(timeout=2)
             in_thread.join(timeout=2)
         except BaseException:
-            _kill_group(proc)
+            with state_lock:
+                finished = True
+                timer.cancel()
+                _kill_group(proc)
+            if has_waitid:
+                watch_thread.join(timeout=2)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
             raise
         finally:
-            timer.cancel()
-            # Unconditionally reap any surviving descendants in the process group before closing streams
-            _kill_group(proc)
+            with state_lock:
+                finished = True
+                timer.cancel()
+                if proc.poll() is None:
+                    _kill_group(proc)
+            if has_waitid:
+                watch_thread.join(timeout=2)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
             err_thread.join(timeout=2)
             in_thread.join(timeout=2)
             for stream in (proc.stdout, proc.stderr):
@@ -643,10 +755,21 @@ def run_in_sandbox(
             pass_fds = (secret_r,)
 
         try:
-            with VendorProxy(sock_path, allowlist=spec.vendor_hosts, log_path=proxy_log_path) as proxy:
-                use_socat = shutil.which("socat") is not None
+            proxy_idle = max(300, int(spec.timeout_s))
+            with VendorProxy(
+                sock_path,
+                allowlist=spec.vendor_hosts,
+                log_path=proxy_log_path,
+                idle_timeout=proxy_idle,
+            ) as proxy:
+                socat_path = _sandbox_accessible_socat()
                 bwrap_cmd = build_bwrap_command(
-                    spec, sock_path, etc_dir, use_socat=use_socat, secret_fd=secret_r
+                    spec,
+                    sock_path,
+                    etc_dir,
+                    use_socat=socat_path is not None,
+                    secret_fd=secret_r,
+                    socat_path=socat_path,
                 )
                 proc = subprocess.Popen(
                     bwrap_cmd,

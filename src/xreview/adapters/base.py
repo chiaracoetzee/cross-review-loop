@@ -23,11 +23,43 @@ _QUOTA_PATTERNS = (
 )
 
 
+_RESUME_FAILURE_PATTERNS = (
+    re.compile(
+        r"\b(?:session|conversation|thread)\b[^\n]{0,80}?"
+        r"\b(?:not found|missing|unknown|invalid|expired|corrupt(?:ed)?|does not exist|no such)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:could not|failed to|unable to|cannot)\s+(?:resume|load|find)\b[^\n]{0,80}?"
+        r"\b(?:session|conversation|thread)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:no|unknown|invalid|expired|missing)\s+(?:session|conversation|thread)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
 def detect_quota_exhausted(text: str) -> bool:
     """Return True if error diagnostics indicate subscription quota exhaustion."""
     if not text:
         return False
     return any(p.search(text) for p in _QUOTA_PATTERNS)
+
+
+_AUTH_SESSION_EXCLUSION = re.compile(
+    r"\b(?:oauth|auth|login|token|credential|cookie)\s+session\b",
+    re.IGNORECASE,
+)
+
+
+def detect_resume_failed(text: str) -> bool:
+    """Return True if harness error diagnostics indicate a missing/invalid/expired warm session (F-017, F-023)."""
+    if not text:
+        return False
+    cleaned = _AUTH_SESSION_EXCLUSION.sub("", text)
+    return any(p.search(cleaned) for p in _RESUME_FAILURE_PATTERNS)
 
 
 def parse_json_from_text(text: str) -> dict[str, Any] | None:

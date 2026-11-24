@@ -310,6 +310,7 @@ class ReviewerRuntimeState:
     last_allowance_ratio: float | None = None
     shared_state_note: str | None = None
     evidence_exposed: list[str] = field(default_factory=list)  # Cumulative evidence IDs seen by this session
+    initial_review_completed: bool = False  # True once reviewer completed a valid initial BASE.diff review (F-001)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -330,14 +331,21 @@ class ReviewerRuntimeState:
             "last_allowance_ratio": self.last_allowance_ratio,
             "shared_state_note": self.shared_state_note,
             "evidence_exposed": sorted(set(self.evidence_exposed)),
+            "initial_review_completed": self.initial_review_completed,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReviewerRuntimeState:
+        sid = str(data["session_id"]) if data.get("session_id") else None
+        init_done = (
+            bool(data["initial_review_completed"])
+            if "initial_review_completed" in data
+            else bool(sid)
+        )
         return cls(
             config=ReviewerConfig.from_dict(data["config"]),
             status=str(data.get("status", "active")),
-            session_id=str(data["session_id"]) if data.get("session_id") else None,
+            session_id=sid,
             harness_version=str(data["harness_version"]) if data.get("harness_version") else None,
             version_warning=str(data["version_warning"]) if data.get("version_warning") else None,
             consecutive_incomplete=int(data.get("consecutive_incomplete", 0)),
@@ -352,6 +360,7 @@ class ReviewerRuntimeState:
             last_allowance_ratio=float(data["last_allowance_ratio"]) if data.get("last_allowance_ratio") is not None else None,
             shared_state_note=str(data["shared_state_note"]) if data.get("shared_state_note") else None,
             evidence_exposed=list(data.get("evidence_exposed", ())),
+            initial_review_completed=init_done,
         )
 
 

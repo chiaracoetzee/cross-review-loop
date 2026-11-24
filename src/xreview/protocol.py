@@ -192,7 +192,7 @@ def init_run(
         gd, cd = git_dirs_for_repo(root_path)
         repo_forbidden_roots.extend([root_path, gd, cd])
         # Pin base_rev (and target_rev if given) to resolved commit SHAs for the whole run (astra-67)
-        pinned_base = resolve_commit_sha(root_path, r.base_rev)
+        pinned_base = resolve_commit_sha(root_path, r.base_rev, allow_empty_tree=True)
         pinned_target = resolve_commit_sha(root_path, r.target_rev) if r.target_rev is not None else None
         validated_repos.append(
             RepoSpec(name=r.name, path=root_path, base_rev=pinned_base, target_rev=pinned_target)
@@ -385,6 +385,8 @@ def triage_finding(
             f.fix_revision += 1
             f.fix_snapshot_hash = ""
             f.deferral_requires_concession = False
+            f.proposed_severity = None
+            f.proposed_severity_reason = ""
             f.replacement_verified_revision = 0
             # Concessions to earlier dispositions never excuse live finders from verifying a new fix (astra-65)
             for fr in f.found_by:
@@ -1263,13 +1265,13 @@ def _run_single_reviewer_round(
     proxy_log = raw_dir / f"{rc.name}.proxy.log"
     no_sb = not use_sandbox
 
-    if round_num == 1:
+    if round_num == 1 or (not rstate.initial_review_completed and not obligations):
         prompt = (
             f"Read `{inputs_mount}/BRIEF.md` and `{inputs_mount}/BASE.diff`, then inspect the relevant files "
             f"in the snapshot tree. Perform a thorough independent review and return JSON matching `{inputs_mount}/schema.json`."
         )
         session_id = None
-    elif not rstate.session_id:
+    elif not rstate.session_id or not rstate.initial_review_completed:
         prompt = _build_followup_message(
             ledger, rc, round_num, inputs_mount, docs_mount, obligations, recipient_current_visibility, cold_restart=True
         )
@@ -1641,11 +1643,13 @@ def run_round(
             for name, r in ledger.reviewers.items()
         }
 
-        # If evidence was revoked from any active reviewer, reset its warm session & wipe state_dir (astra-47)!
+        # If evidence was revoked from any active reviewer, reset its warm session, wipe state_dir,
+        # and reset evidence_exposed to current visibility so the fresh session isn't wiped every round (astra-47, F-002)!
         for rname, rstate in ledger.reviewers.items():
             revoked = set(rstate.evidence_exposed) - set(current_vis_by_reviewer[rname])
             if revoked and rname not in ledger.pending_round_results:
                 rstate.session_id = None
+                rstate.evidence_exposed = sorted(current_vis_by_reviewer[rname])
                 st_dir = run_dir / "state" / rname
                 if st_dir.exists() and not st_dir.is_symlink():
                     shutil.rmtree(st_dir, ignore_errors=True)
@@ -1745,6 +1749,8 @@ def run_round(
         for rname, (res, val_errors) in results_map.items():
             rstate = ledger.reviewers[rname]
             if res.quota_exhausted:
+                if not rstate.initial_review_completed:
+                    rstate.session_id = None
                 if rstate.config.extra:
                     rstate.status = "dropped_quota"
                     warnings.append(f"Dropped extra reviewer {rname} (quota exhausted)")
@@ -1754,6 +1760,8 @@ def run_round(
                 continue
 
             if val_errors or res.reply is None or res.returncode != 0 or res.error:
+                if not rstate.initial_review_completed:
+                    rstate.session_id = None
                 rstate.consecutive_incomplete += 1
                 incomplete_reviewers.add(rname)
                 warnings.append(
@@ -1765,6 +1773,7 @@ def run_round(
                 continue
 
             rstate.consecutive_incomplete = 0
+            rstate.initial_review_completed = True
             valid_replies[rname] = res.reply
 
         new_findings_ids: list[str] = []
@@ -1858,9 +1867,13 @@ def run_round(
                     elif kind == "fix" and fr is not None:
                         if verdict == "fix_ok":
                             fr.verified_fix_revision = f.fix_revision
+                            if f.replacement_verifier == rname:
+                                f.replacement_verified_revision = f.fix_revision
                         elif verdict == "fix_incomplete":
                             disagreed_this_round.add(fid)
                             fr.verified_fix_revision = 0
+                            if f.replacement_verifier == rname:
+                                f.replacement_verified_revision = 0
 
                     elif kind == "fix_replacement":
                         if verdict == "fix_ok" and f.replacement_verifier == rname:

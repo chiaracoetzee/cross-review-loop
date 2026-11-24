@@ -16,6 +16,7 @@ from xreview.adapters.base import (
     TurnRequest,
     TurnResult,
     detect_quota_exhausted,
+    detect_resume_failed,
     parse_json_from_text,
 )
 from xreview.config import (
@@ -299,7 +300,7 @@ class CodexAdapter(HarnessAdapter):
         quota = not succeeded and (rl_reached or detect_quota_exhausted(diag_err))
         malformed = bool(succeeded and reply is None)
         resume_failed = bool(
-            req.session_id and not succeeded and not quota and not sb_res.timed_out
+            req.session_id and not succeeded and not quota and not sb_res.timed_out and detect_resume_failed(diag_err)
         )
 
         error = None
