@@ -1,0 +1,35 @@
+# Example trusted environment profile (kept outside public project repos)
+
+brief_rules = [
+  "Never commit, push, or deploy without explicit user approval.",
+  "Do not edit generated files by hand; modify their source schema and regenerate.",
+]
+
+extra_secret_patterns = [
+  "*.secret",
+  "service-account*.json",
+]
+
+[tags.security]
+vendors = "ask"            # user must explicitly approve --reviewers for each security run
+post_run_hooks = false
+
+[tags.private]
+vendors = "ask"
+post_run_hooks = false
+
+[tags.personal-data]
+vendors = "ask"            # hidden until user approves --allow personal-data=<vendor>
+post_run_hooks = false
+
+# Example repository-specific rules:
+# [[repo_rules]]
+# path = "/path/to/my-private-repo"
+# tags = ["private"]
+# exclude_submodules = ["vendor/large-unchanged-submodule"]
+
+# Example post-run hook (skipped automatically when any run tag sets post_run_hooks = false).
+# Run metadata is passed via XREVIEW_RUN_ID, XREVIEW_RUN_DIR, XREVIEW_LEDGER_MD,
+# XREVIEW_LEDGER_JSON, XREVIEW_ISSUE, and XREVIEW_STATUS environment variables.
+# [hooks]
+# post_run = ['echo "Run $XREVIEW_RUN_ID finished with status $XREVIEW_STATUS; ledger at $XREVIEW_LEDGER_MD"']
