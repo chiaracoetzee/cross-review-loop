@@ -31,6 +31,7 @@ from xreview.protocol import (
     drop_reviewer,
     init_run,
     merge_findings,
+    reinstate_reviewer,
     resolve_trusted_run_dir,
     run_pending_hooks,
     run_round,
@@ -178,6 +179,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_drop.add_argument("run_id")
     p_drop.add_argument("reviewer", help="Reviewer name to permanently drop from the run")
+
+    # reinstate
+    p_rein = sub.add_parser(
+        "reinstate",
+        help="Reactivate a shed/dropped/paused reviewer in an existing run (clears shed_plans for its plan)",
+    )
+    p_rein.add_argument("run_id")
+    p_rein.add_argument("reviewer", help="Reviewer name to reactivate in the run")
 
     # status
     p_st = sub.add_parser("status", help="Show run status, open findings, and unclassified files")
@@ -470,6 +479,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             live_names = [r.config.name for r in ledger.live_reviewers()]
             print(
                 f"Dropped {args.reviewer} from run {ledger.run_id} "
+                f"(status={ledger.status}; active={', '.join(live_names)})"
+            )
+            return 0
+
+        if args.command == "reinstate":
+            ledger = reinstate_reviewer(run_dir, config, args.reviewer)
+            live_names = [r.config.name for r in ledger.live_reviewers()]
+            print(
+                f"Reinstated {args.reviewer} in run {ledger.run_id} "
                 f"(status={ledger.status}; active={', '.join(live_names)})"
             )
             return 0

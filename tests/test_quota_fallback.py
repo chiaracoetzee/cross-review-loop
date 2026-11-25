@@ -1477,6 +1477,104 @@ class QuotaFallbackTests(unittest.TestCase):
             self.assertEqual(rc_cli, 0)
             self.assertEqual(load_ledger(run_dir2).reviewers["astra"].status, "dropped_user")
 
+    def test_sole_extra_never_shed_at_80pct_and_reinstate_rescues_shed_run(self) -> None:
+        from xreview.adapters.base import TurnResult
+        from xreview.cli import main
+        from xreview.ledger import load_ledger, save_ledger
+        from xreview.protocol import init_run, reinstate_reviewer, run_round
+        from xreview.snapshot import RepoSpec
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _make_git_repo(root / "repo")
+            cfg = AppConfig(
+                reviewers=(
+                    ReviewerConfig("astra", "codex", "m1", "gpt", "openai"),
+                    ReviewerConfig("carbon", "agy", "m2", "gemini", "google"),
+                    ReviewerConfig("fable", "claude", "m3", "claude", "anthropic"),
+                    ReviewerConfig("sol", "codex", "m1b", "gpt", "openai", extra=True),
+                    ReviewerConfig("hydrogen", "agy", "m2b", "gemini", "google", extra=True),
+                    ReviewerConfig("sonnet", "claude", "m3b", "claude", "anthropic", extra=True),
+                ),
+                policy=PolicyConfig(
+                    min_families=3,
+                    shed_extras_at=0.8,
+                    quota_preflight=False,
+                ),
+                state_dir=root / "state",
+                implementor_family="gemini",
+            )
+            clock = FakeClock()
+
+            def handle(req):
+                if req.reviewer.name == "sonnet":
+                    return TurnResult(session_id="s-sonnet", reply=_reply(), allowance_used_ratio=0.84)
+                return TurnResult(session_id=f"s-{req.reviewer.name}", reply=_reply())
+
+            adapters = {h: FakeAdapter(h, handle) for h in ("codex", "agy", "claude")}
+            # 1) Explicit extras-only run: `--reviewers sonnet,sol,hydrogen` promotes sole-on-plan extras
+            #    so sonnet at 84% (>= shed_extras_at=0.8) is NOT shed and run converges cleanly.
+            run_dir, leg = init_run(
+                cfg,
+                "r-extras-only",
+                [RepoSpec("repo", repo)],
+                "Extras-only test",
+                explicit_reviewers=["sonnet", "sol", "hydrogen"],
+                no_sandbox=True,
+                adapter_lookup=adapters.__getitem__,
+                now_fn=clock,
+            )
+            for name in ("sonnet", "sol", "hydrogen"):
+                self.assertFalse(leg.reviewers[name].config.extra, f"sole-on-plan {name} must be promoted")
+            out1 = run_round(run_dir, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out1.status, "converged")
+            self.assertEqual(load_ledger(run_dir).reviewers["sonnet"].status, "active")
+            self.assertEqual(load_ledger(run_dir).shed_plans, [])
+
+            # 2) Legacy paused run where sonnet still had extra=True and was shed_allowance at 82%:
+            #    `xreview reinstate` reactivates sonnet, clears shed_plans, unpauses, and does not re-shed at 84%!
+            run_dir2, _ = init_run(
+                cfg,
+                "r-rescue",
+                [RepoSpec("repo", repo)],
+                "Rescue shed run",
+                explicit_reviewers=["sonnet", "sol", "hydrogen"],
+                no_sandbox=True,
+                adapter_lookup=adapters.__getitem__,
+                now_fn=clock,
+            )
+            leg2 = load_ledger(run_dir2)
+            leg2.status = "paused"
+            leg2.pause_causes = ["quorum:need at least 3 distinct model families, have 2"]
+            leg2.pause_reason = "Quorum not met"
+            leg2.shed_plans = ["claude"]
+            leg2.reviewers["sonnet"].status = "shed_allowance"
+            leg2.reviewers["sonnet"].config = ReviewerConfig("sonnet", "claude", "m3b", "claude", "anthropic", extra=True)
+            save_ledger(run_dir2, leg2)
+
+            cfg_file = root / "config.toml"
+            cfg_file.write_text(
+                f'state_dir = "{root / "state"}"\n'
+                "[policy]\nmin_families = 3\nshed_extras_at = 0.8\nquota_preflight = false\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(main(["--config", str(cfg_file), "reinstate", "r-rescue", "sonnet"]), 0)
+            leg2_after = load_ledger(run_dir2)
+            self.assertEqual(leg2_after.status, "needs_triage")
+            self.assertEqual(leg2_after.pause_causes, [])
+            self.assertEqual(leg2_after.reviewers["sonnet"].status, "active")
+            self.assertFalse(leg2_after.reviewers["sonnet"].config.extra)
+            self.assertEqual(leg2_after.shed_plans, [])
+
+            out_rescue = run_round(run_dir2, cfg, adapter_lookup=adapters.__getitem__, now_fn=clock)
+            self.assertEqual(out_rescue.status, "converged")
+            self.assertEqual(load_ledger(run_dir2).reviewers["sonnet"].status, "active")
+
+            # Reinstating an already-active reviewer raises ProtocolError
+            from xreview.protocol import ProtocolError
+            with self.assertRaises(ProtocolError):
+                reinstate_reviewer(run_dir2, cfg, "sonnet", now_fn=clock)
+
 
 if __name__ == "__main__":
     unittest.main()

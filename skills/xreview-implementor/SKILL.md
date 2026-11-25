@@ -93,7 +93,7 @@ Configure your implementor harness so lifting a gate always prompts the user:
    - Watch for `HINT (overlapping fix lines)`: verify you did not undo an earlier fix.
    - Repeat steps 3–4 until:
      - **Exit `0` (converged):** present `LEDGER.md` (and any escalated or unverified items) to the user alongside your commit proposal.
-     - **Exit `20` (paused):** stop and present the pause reason and current ledger to the user before continuing (the user may approve `--resume-pause`, `xreview substitute <run-id> <old> --with <new>`, or `xreview drop <run-id> <reviewer>`).
+     - **Exit `20` (paused):** stop and present the pause reason and current ledger to the user before continuing (the user may approve `--resume-pause`, `xreview substitute <run-id> <old> --with <new>`, `xreview drop <run-id> <reviewer>`, or `xreview reinstate <run-id> <reviewer>`).
 
 5. **Clean up** after the user finishes reviewing the ledger:
    ```bash

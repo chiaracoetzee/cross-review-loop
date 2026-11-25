@@ -81,6 +81,40 @@ from xreview.snapshot import (
 _PERMANENT_DROPPED_STATUSES = frozenset({"dropped_quota", "dropped_user", "shed_allowance", "substituted"})
 
 
+def _promote_reviewer_config(rc: ReviewerConfig) -> ReviewerConfig:
+    """Return a copy of ReviewerConfig marked as primary (extra=False) so it is never shed at shed_extras_at."""
+    if not rc.extra:
+        return rc
+    return ReviewerConfig(
+        name=rc.name,
+        harness=rc.harness,
+        model=rc.model,
+        family=rc.family,
+        vendor=rc.vendor,
+        effort=rc.effort,
+        extra=False,
+        enabled=rc.enabled,
+        serialize_group=rc.serialize_group,
+        plan=rc.plan,
+    )
+
+
+def _has_active_core_on_plan(ledger: RunLedger, plan_id: str) -> bool:
+    """Return True if at least one active non-extra (core) reviewer exists on `plan_id`."""
+    return any(
+        r.status == "active" and not r.config.extra and r.config.plan_id == plan_id
+        for r in ledger.reviewers.values()
+    )
+
+
+def _has_active_extra_on_plan(ledger: RunLedger, plan_id: str) -> bool:
+    """Return True if at least one active extra reviewer exists on `plan_id`."""
+    return any(
+        r.status == "active" and r.config.extra and r.config.plan_id == plan_id
+        for r in ledger.reviewers.values()
+    )
+
+
 class ProtocolError(ValueError):
     """Raised when a triage action or round transition violates the review protocol."""
 
@@ -298,6 +332,14 @@ def init_run(
                 details.append(f"Quota probe warnings: {'; '.join(quota_warnings)}")
             suffix = (" " + " ".join(details)) if details else ""
             raise PolicyViolation(f"{exc}{suffix}") from exc
+
+    # Promote sole-on-plan extras (e.g. explicit `--reviewers sonnet,sol,hydrogen`) to primary (extra=False)
+    # so `shed_extras_at` never sheds the only reviewer on a plan when no core reviewer is present.
+    plans_with_core = {rc.plan_id for rc in selected_reviewers if not rc.extra}
+    selected_reviewers = [
+        _promote_reviewer_config(rc) if (rc.extra and rc.plan_id not in plans_with_core) else rc
+        for rc in selected_reviewers
+    ]
 
     # Validate adapters and reviewer names BEFORE reserving run_dir (astra-69)
     reviewer_states: dict[str, ReviewerRuntimeState] = {}
@@ -812,6 +854,74 @@ def drop_reviewer(
                 f.replacement_verified_revision = 0
         _handle_dropouts_and_replacements(ledger, now_fn, ledger.current_round)
 
+        ledger.pause_causes = [
+            c for c in ledger.pause_causes
+            if c not in (f"quota:{reviewer_name}", f"incomplete:{reviewer_name}")
+            and not c.startswith("quorum:")
+        ]
+        try:
+            check_quorum([r.config for r in ledger.live_reviewers()], eff_min_fams, ledger.implementor_family)
+        except PolicyViolation as exc:
+            ledger.pause_causes.append(f"quorum:{exc}")
+        _rebuild_pause_reason(ledger)
+        save_ledger(run_dir, ledger)
+        return ledger
+
+
+def reinstate_reviewer(
+    run_dir: Path,
+    config: AppConfig,
+    reviewer_name: str,
+    *,
+    now_fn: Callable[[], str] = default_now_iso,
+) -> RunLedger:
+    """Reactivate a shed/dropped/paused reviewer inside an existing run (explicit user override)."""
+    with run_lock(run_dir):
+        ledger = load_ledger(run_dir)
+        _assert_not_in_progress(ledger)
+        if reviewer_name not in ledger.reviewers:
+            raise ProtocolError(f"Reviewer {reviewer_name!r} is not part of run {ledger.run_id}.")
+        rstate = ledger.reviewers[reviewer_name]
+        if rstate.status == "active":
+            raise ProtocolError(f"Reviewer {reviewer_name!r} is already active in run {ledger.run_id}.")
+        if rstate.status == "substituted":
+            raise ProtocolError(
+                f"Cannot reinstate reviewer {reviewer_name!r}: it was already substituted."
+            )
+        if rstate.status not in ("shed_allowance", "dropped_quota", "dropped_user", "quota_paused"):
+            raise ProtocolError(
+                f"Cannot reinstate reviewer {reviewer_name!r} with status={rstate.status!r}."
+            )
+
+        candidate_list = [r.config for r in ledger.live_reviewers()] + [rstate.config]
+        enforce_tags_on_active_reviewers(config, ledger.run_tags, candidate_list, set(ledger.approved_ask_tags))
+
+        # Promote to primary (extra=False) and clear plan from shed_plans so an explicitly reinstated
+        # reviewer is not immediately re-shed at shed_extras_at on the very next round.
+        rstate.config = _promote_reviewer_config(rstate.config)
+        rstate.status = "active"
+        rstate.consecutive_incomplete = 0
+        pid = rstate.config.plan_id
+        ledger.shed_plans = [p for p in ledger.shed_plans if p != pid]
+
+        # If any open finding only needed a replacement_verifier because this reviewer dropped out,
+        # clear that replacement so the original finder verifies its own finding again.
+        perm_dropped = {
+            name for name, r in ledger.reviewers.items()
+            if r.status in _PERMANENT_DROPPED_STATUSES
+        }
+        for f in ledger.findings:
+            if f.state != "open" or not f.replacement_verifier:
+                continue
+            still_has_dropped = any(
+                (not fr.conceded) and fr.reviewer in perm_dropped
+                for fr in f.found_by
+            )
+            if not still_has_dropped:
+                f.replacement_verifier = None
+                f.replacement_verified_revision = 0
+
+        eff_min_fams = ledger.min_families_override or config.policy.min_families
         ledger.pause_causes = [
             c for c in ledger.pause_causes
             if c not in (f"quota:{reviewer_name}", f"incomplete:{reviewer_name}")
@@ -1864,7 +1974,7 @@ def run_round(
                 with ledger_lock:
                     if rc.name in results_map:
                         continue
-                    if rc.extra and rc.plan_id in ledger.shed_plans:
+                    if rc.extra and rc.plan_id in ledger.shed_plans and _has_active_core_on_plan(ledger, rc.plan_id):
                         rstate.status = "shed_allowance"
                         warnings.append(
                             f"Shed extra reviewer {rc.name}: plan {rc.plan_id!r} exceeded shed_extras_at"
@@ -1903,7 +2013,11 @@ def run_round(
                         rstate.total_cost_usd += float(res.usage.get("total_cost_usd", 0.0) or 0.0)
                     if res.allowance_used_ratio is not None:
                         rstate.last_allowance_ratio = res.allowance_used_ratio
-                        if res.allowance_used_ratio >= config.policy.shed_extras_at:
+                        if (
+                            res.allowance_used_ratio >= config.policy.shed_extras_at
+                            and _has_active_core_on_plan(ledger, rc.plan_id)
+                            and _has_active_extra_on_plan(ledger, rc.plan_id)
+                        ):
                             if rc.plan_id not in ledger.shed_plans:
                                 ledger.shed_plans.append(rc.plan_id)
                     if res.quota_exhausted:
@@ -1946,7 +2060,11 @@ def run_round(
                 fut.result()
 
         for rstate in ledger.live_reviewers():
-            if rstate.config.extra and rstate.config.plan_id in ledger.shed_plans:
+            if (
+                rstate.config.extra
+                and rstate.config.plan_id in ledger.shed_plans
+                and _has_active_core_on_plan(ledger, rstate.config.plan_id)
+            ):
                 if rstate.config.name not in results_map or results_map[rstate.config.name][0].quota_exhausted:
                     rstate.status = "shed_allowance"
                 elif rstate.last_allowance_ratio is not None and rstate.last_allowance_ratio >= config.policy.shed_extras_at:
