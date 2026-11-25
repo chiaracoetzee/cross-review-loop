@@ -281,7 +281,7 @@ class ReviewerConfig:
 class PolicyConfig:
     credits: str = "never"
     min_families: int = 2
-    soft_round_ceiling: int = 6
+    soft_round_ceiling: int = 10
     shed_extras_at: float = 0.8
     fallback_to_extras_at: float | None = 0.75
     auto_drop_exhausted: bool = True
@@ -476,7 +476,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     policy = PolicyConfig(
         credits=str(pol_raw.get("credits", "never")),
         min_families=int(pol_raw.get("min_families", 2)),
-        soft_round_ceiling=int(pol_raw.get("soft_round_ceiling", 6)),
+        soft_round_ceiling=int(pol_raw.get("soft_round_ceiling", 10)),
         shed_extras_at=float(pol_raw.get("shed_extras_at", 0.8)),
         fallback_to_extras_at=fallback_at,
         auto_drop_exhausted=bool(pol_raw.get("auto_drop_exhausted", True)),

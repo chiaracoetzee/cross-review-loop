@@ -23,7 +23,7 @@ reviewers = [
 [policy]
 credits = "never"              # disable agy paid credits in CLI flags & stop on quota (keep Claude/ChatGPT overage off in account settings)
 min_families = 2               # refuse to start with fewer distinct model families
-soft_round_ceiling = 6         # pause and ask user after this many rounds
+soft_round_ceiling = 10        # pause and ask user after this many rounds
 live_quota_probe = true        # run live agy /usage + tiny Claude haiku check before init and on `xreview quota`
 fallback_to_extras_at = 0.75   # back out of heavyweight core models when a plan is >= 75% used
 auto_drop_exhausted = true     # drop 100%-exhausted plans at init and mid-run (down to a 2-family hard floor)
